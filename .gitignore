@@ -1,0 +1,10 @@
+node_modules/
+dist/
+out-test/
+.vscode-test/
+.tmp-vscode-ext/
+.tmp-vscode-user/
+.tmp-vscode-probe.png
+*.vsix
+local/
+docs/media/*.mp4

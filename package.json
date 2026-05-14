@@ -1,0 +1,211 @@
+{
+  "name": "opencode-tui-integration",
+  "displayName": "OpenCode TUI Integration",
+  "description": "Start OpenCode from VS Code and review agent edits with a persistent Keep/Undo queue",
+  "version": "0.1.0",
+  "publisher": "satoshihojo",
+  "preview": true,
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#151515",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/satoshihojo/vscode-opencode-tui.git"
+  },
+  "homepage": "https://github.com/satoshihojo/vscode-opencode-tui",
+  "bugs": {
+    "url": "https://github.com/satoshihojo/vscode-opencode-tui/issues"
+  },
+  "markdown": "github",
+  "qna": false,
+  "pricing": "Free",
+  "keywords": [
+    "opencode",
+    "agent",
+    "ai",
+    "diff",
+    "review"
+  ],
+  "engines": {
+    "vscode": "^1.118.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "OpenCode TUI Integration requires a local writable workspace so it can launch opencode and review real file edits."
+    },
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "OpenCode TUI Integration launches a local opencode terminal and writes local workspace files through the review queue."
+    }
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "opencodeEdit.startSession",
+        "title": "Start OpenCode Session",
+        "category": "OpenCode TUI Integration",
+        "icon": {
+          "light": "media/opencode-button-dark.svg",
+          "dark": "media/opencode-button-light.svg"
+        }
+      },
+      {
+        "command": "opencodeEdit.probeApplyDiscard",
+        "title": "Probe Native Apply/Discard",
+        "category": "OpenCode TUI Integration"
+      },
+      {
+        "command": "opencodeEdit.probeScratchEdit",
+        "title": "Probe Native Apply/Discard in Scratch Document",
+        "category": "OpenCode TUI Integration"
+      },
+      {
+        "command": "opencodeEdit.queueReviewEdit",
+        "title": "Queue Review Edit",
+        "category": "OpenCode TUI Integration"
+      },
+      {
+        "command": "opencodeEdit.review.openDiff",
+        "title": "OpenCode Review: Open Diff"
+      },
+      {
+        "command": "opencodeEdit.review.keep",
+        "title": "OpenCode Review: Keep"
+      },
+      {
+        "command": "opencodeEdit.review.undo",
+        "title": "OpenCode Review: Undo"
+      },
+      {
+        "command": "opencodeEdit.review.keepAll",
+        "title": "OpenCode Review: Keep All"
+      },
+      {
+        "command": "opencodeEdit.review.undoAll",
+        "title": "OpenCode Review: Undo All"
+      }
+    ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "opencodeEdit",
+          "title": "OpenCode",
+          "icon": "media/review.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodeEdit": [
+        {
+          "id": "opencodeEdit.reviewPanel",
+          "name": "Review",
+          "type": "webview"
+        },
+        {
+          "id": "opencodeEdit.sessionsPanel",
+          "name": "Sessions",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "opencodeEdit.review.openDiff",
+          "when": "false"
+        },
+        {
+          "command": "opencodeEdit.review.keep",
+          "when": "false"
+        },
+        {
+          "command": "opencodeEdit.review.undo",
+          "when": "false"
+        },
+        {
+          "command": "opencodeEdit.review.keepAll",
+          "when": "false"
+        },
+        {
+          "command": "opencodeEdit.review.undoAll",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenCode TUI Integration",
+      "properties": {
+        "opencodeEdit.notifications.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable OpenCode session notifications."
+        },
+        "opencodeEdit.notifications.backgroundOnly": {
+          "type": "boolean",
+          "default": true,
+          "description": "Only show popup notifications when the VS Code window is not focused."
+        },
+        "opencodeEdit.notifications.onIdle": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when an OpenCode session finishes after being busy."
+        },
+        "opencodeEdit.notifications.onPermission": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when OpenCode is waiting for a permission response."
+        },
+        "opencodeEdit.notifications.onError": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when OpenCode reports a session error."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "node scripts/build.mjs && node scripts/postcompile.mjs",
+    "check-types": "tsc --noEmit -p tsconfig.json",
+    "compile-tests": "node scripts/compile-tests.mjs",
+    "test": "npm run compile-tests && node scripts/run-unit-tests.mjs",
+    "test:integration": "npm run compile && npm run compile-tests && xvfb-run -a node out-test/test/integration/run-tests.js",
+    "test:recording": "npm run compile && npm run compile-tests && xvfb-run -a -s '-screen 0 1280x1024x24' node out-test/test/integration/recording/run-recording.js",
+    "package": "node scripts/package-vsix.mjs",
+    "package:pre-release": "node scripts/package-vsix.mjs --pre-release",
+    "package:check": "node scripts/check-package.mjs",
+    "verify": "npm run check-types && npm run compile && npm run test && npm run test:integration && npm run package:check"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.14.39",
+    "@types/diff": "^8.0.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.17.50",
+    "@types/node-notifier": "^8.0.5",
+    "@types/vscode": "^1.94.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.1",
+    "diff": "^8.0.2",
+    "esbuild": "^0.25.11",
+    "typescript": "^5.8.3",
+    "zod": "^4.1.8"
+  },
+  "dependencies": {
+    "node-notifier": "^10.0.1"
+  }
+}

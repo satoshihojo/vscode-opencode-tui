@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to update when running manually (for example v0.1.0-beta.1)
+        required: false
+        type: string
+      prerelease:
+        description: Mark the packaged VSIX and GitHub Release as pre-release
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-vsix:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag != '' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb ffmpeg libgtk-3-0 libnss3 libasound2t64 libxss1 libgbm1 libxshmfence1 libatk-bridge2.0-0 libdrm2 libxkbcommon0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify release candidate
+        run: npm run verify
+
+      - name: Determine release mode
+        id: release_mode
+        shell: bash
+        run: |
+          RELEASE_TAG=""
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            PRERELEASE="${{ inputs.prerelease }}"
+            RELEASE_TAG="${{ inputs.release_tag }}"
+            if [[ -z "$RELEASE_TAG" && "$GITHUB_REF" == refs/tags/* ]]; then
+              RELEASE_TAG="${GITHUB_REF_NAME}"
+            fi
+          elif [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            PRERELEASE=true
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          else
+            PRERELEASE=false
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ "$PRERELEASE" == "true" ]]; then
+            PACKAGE_SCRIPT="package:pre-release"
+          else
+            PACKAGE_SCRIPT="package"
+          fi
+
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "package_script=$PACKAGE_SCRIPT" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Package VSIX
+        run: npm run ${{ steps.release_mode.outputs.package_script }}
+
+      - name: Capture VSIX path
+        id: vsix
+        shell: bash
+        run: |
+          VSIX_PATH="$(ls -1 *.vsix | head -n 1)"
+          if [ -z "$VSIX_PATH" ]; then
+            echo "No VSIX artifact was produced." >&2
+            exit 1
+          fi
+          echo "path=$VSIX_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: opencode-tui-integration-vsix
+          path: ${{ steps.vsix.outputs.path }}
+
+      - name: Create or update GitHub release
+        if: steps.release_mode.outputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_mode.outputs.release_tag }}
+          RELEASE_NAME: OpenCode TUI Integration ${{ steps.release_mode.outputs.release_tag }}
+          VSIX_PATH: ${{ steps.vsix.outputs.path }}
+          PRERELEASE: ${{ steps.release_mode.outputs.prerelease }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_NAME" \
+              --draft=false \
+              --prerelease="$PRERELEASE" \
+              --verify-tag
+            gh release upload "$RELEASE_TAG" "$VSIX_PATH" --clobber
+            exit 0
+          fi
+
+          CREATE_ARGS=(
+            "$RELEASE_TAG"
+            "$VSIX_PATH"
+            --title "$RELEASE_NAME"
+            --generate-notes
+          )
+
+          if [[ "$PRERELEASE" == "true" ]]; then
+            CREATE_ARGS+=(--prerelease)
+          fi
+
+          CREATE_ARGS+=(--verify-tag)
+
+          gh release create "${CREATE_ARGS[@]}"
