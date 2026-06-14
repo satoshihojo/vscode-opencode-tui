@@ -207,10 +207,10 @@ async function buildSessionBrowserItems(
   options: { separateArchivedSessions?: boolean } = {},
 ): Promise<SessionQuickPickItem[]> {
   const sessionViews = await withDirectoryExistence(sessions, messages);
-  const currentRoots = new Set(workspaceFolders.map((folder) => folder.uri));
+  const currentRoots = new Set(workspaceFolders.map((folder) => normalizePathForComparison(folder.uri)));
   const separateArchivedSessions = options.separateArchivedSessions === true;
-  const current = sessionViews.filter((session) => session.directoryExists && session.directory && currentRoots.has(session.directory) && (!separateArchivedSessions || !isArchivedSession(session)));
-  const other = sessionViews.filter((session) => session.directoryExists && (!session.directory || !currentRoots.has(session.directory)) && (!separateArchivedSessions || !isArchivedSession(session)));
+  const current = sessionViews.filter((session) => session.directoryExists && session.directory && currentRoots.has(normalizePathForComparison(session.directory)) && (!separateArchivedSessions || !isArchivedSession(session)));
+  const other = sessionViews.filter((session) => session.directoryExists && (!session.directory || !currentRoots.has(normalizePathForComparison(session.directory))) && (!separateArchivedSessions || !isArchivedSession(session)));
   const archived = separateArchivedSessions
     ? sessionViews.filter((session) => isArchivedSession(session))
     : [];
@@ -517,9 +517,9 @@ async function buildManageSessionItems(
   preselectedSessionIds: string[] = [],
 ) {
   const sessionViews = await withDirectoryExistence(sessions, messages);
-  const currentRoots = new Set(workspaceFolders.map((folder) => folder.uri));
-  const current = sessionViews.filter((session) => session.directoryExists && session.directory && currentRoots.has(session.directory));
-  const other = sessionViews.filter((session) => session.directoryExists && (!session.directory || !currentRoots.has(session.directory)));
+  const currentRoots = new Set(workspaceFolders.map((folder) => normalizePathForComparison(folder.uri)));
+  const current = sessionViews.filter((session) => session.directoryExists && session.directory && currentRoots.has(normalizePathForComparison(session.directory)));
+  const other = sessionViews.filter((session) => session.directoryExists && (!session.directory || !currentRoots.has(normalizePathForComparison(session.directory))));
   const invalid = sessionViews.filter((session) => !session.directoryExists);
   const buttons = createSessionItemButtons(messages);
 
@@ -592,8 +592,10 @@ async function openSessionFromItem(
   }
 
   if (selected.directoryExists === false) {
-    await messages.showWarningMessage?.(formatMissingDirectoryMessage(selected.session), { modal: false });
-    return;
+    await messages.showWarningMessage?.(
+      "The directory for this session may not be directly accessible from VS Code, but the session can still be opened.",
+      { modal: false },
+    );
   }
 
   quickPick.hide();
@@ -784,6 +786,13 @@ function formatMissingDirectoryMessage(session: OpenCodeSessionSummary) {
   return session.directory
     ? `Cannot open OpenCode session because its directory no longer exists: ${session.directory}`
     : "Cannot open OpenCode session because it has no recorded directory.";
+}
+
+function normalizePathForComparison(path: string): string {
+  return path
+    .replace(/\\/g, "/")
+    .toLowerCase()
+    .replace(/\/+$/, "");
 }
 
 function disposeAll(disposables: Disposable[], quickPick: SessionQuickPickLike) {

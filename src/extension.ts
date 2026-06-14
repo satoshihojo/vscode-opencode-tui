@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import * as vscode from "vscode";
 import { readApplyPatchFailureRecords, type ApplyPatchFailureRecord } from "./apply-patch-failure-log";
 import { BridgeServer } from "./bridge-server";
@@ -15,42 +14,18 @@ import {
 import { createStartOpenCodeSessionCommand } from "./commands/start-opencode-session";
 import {
   OpenCodeSessionManager,
-  buildOpenCodeRelaunchCommand,
   buildOpenCodeTerminalName,
   buildSessionConfigContent,
   isValidSessionId,
-  type OpenCodeTerminalShell,
+  type StartSessionOptions,
 } from "./opencode/session-manager";
-import {
-  signalOpenCodeProcess,
-  tryTerminateExistingOpenCodeProcessForReuse,
-} from "./opencode/relaunch-recovery";
 import { OpenCodeBackgroundNotifier, type OpenCodeNotificationSettings, type OpenCodeSourceState } from "./notifications/opencode-notifier";
 import { NodeNotifierExternalNotifier } from "./notifications/external-notifier";
 import { OpenCodeSessionEventMonitor, type OpenCodeEvent } from "./opencode/session-event-monitor";
 import { resolveActiveSessionPanelSelection } from "./opencode/active-terminal-selection";
 import {
-  createOpenCodeTerminalMatcher,
-  matchesOpenCodeTerminal,
-  readLatestSessionForDirectory,
-  readSessionRestoreInfos,
-  resolveOpenCodeTerminalRestoreId,
-  resolveRestoreSessionOptions,
-  resolveSessionTitle,
-  shouldRetrySessionTitleResolution,
-  shouldClearRestoreStateAfterMissingTerminal,
-  removeSessionRestoreInfo,
-  toSessionLaunchOptions,
-  toSessionRestoreInfo,
-  updateRestoreInfoFromSession,
-  updatePersistedRestoreStateSnapshot,
-  updateSessionRestoreInfo,
-  upsertSessionRestoreInfo,
-  waitForOpenCodeTerminalRestore,
-  type PersistedRestoreState,
-  type PersistedSessionRestoreInfo,
-  type SessionRestoreInfo,
-  type SessionRestoreLaunchOptions,
+  createSessionRestoreId,
+  dedupeSessionsByTitle,
 } from "./opencode/session-restore";
 import { OpenCodeSessionRepository, type OpenCodeSessionSummary } from "./opencode/session-repository";
 import { OpenCodeSessionTitlePoller } from "./opencode/session-title-poller";
@@ -87,10 +62,6 @@ import { calculateStats, ReviewQueueStore } from "./review/review-queue-store";
 import type { DocumentSnapshot, NormalizedProposal } from "./types/proposal";
 
 const REVIEW_QUEUE_STATE_KEY = "opencodeEdit.reviewQueue";
-const SESSION_RESTORE_STATE_KEY = "opencodeEdit.restoreSessionOnReload";
-const SESSION_RESTORE_INFO_KEY = "opencodeEdit.lastOpenCodeSessionLaunch";
-const SESSION_RESTORE_LIST_KEY = "opencodeEdit.openCodeSessionLaunches";
-const OPENCODE_TERMINAL_RESTORE_IDS_KEY = "opencodeEdit.openCodeTerminalRestoreIds";
 const APPLY_PATCH_FAILURE_RECORDS_KEY = "opencodeEdit.applyPatchFailureRecords";
 const MONITOR_ERROR_LOG_COOLDOWN_MS = 30000;
 const MAX_MONITOR_ERROR_LOG_BUCKETS = 200;
@@ -98,16 +69,11 @@ const TITLE_RECONCILIATION_RETRY_LIMIT = 6;
 const TITLE_RECONCILIATION_RETRY_DELAY_MS = 1000;
 type ManagedOpenCodeTerminal = vscode.Terminal & {
   opencodeRestoreId?: string;
-  opencodeProcessId?: number;
-  opencodeDetachedFromRestore?: boolean;
-  creationOptions?: Readonly<vscode.TerminalOptions | vscode.ExtensionTerminalOptions>;
 };
 type ManagedOpenCodeSession = {
   terminal: ManagedOpenCodeTerminal;
   openCodePort: number;
 };
-
-let restoreStateWrite: Promise<void> = Promise.resolve();
 
 export function activate(context: vscode.ExtensionContext) {
   const persistedReviewQueueItems = loadPersistedReviewQueueItems(context);
@@ -199,17 +165,22 @@ export function activate(context: vscode.ExtensionContext) {
       await vscode.commands.executeCommand("opencodeEdit.startSession");
     },
     markSelected: (restoreId) => {
-      if (hasTrackedRestoreId(context.workspaceState, restoreId)) {
-        queueOpenCodeTitleReconciliation(restoreId, 0);
+      queueOpenCodeTitleReconciliation(restoreId, 0);
+    },
+    revealSession: (restoreId) => {
+      const terminal = findOpenCodeTerminalByRestoreId(restoreId);
+      if (terminal) {
+        terminal.show(false);
       }
     },
-    revealSession: (restoreId) => revealOpenCodeSessionByRestoreId(context.workspaceState, restoreId),
     closeSession: async (restoreId) => {
-      const terminal = await findTrackedOpenCodeTerminal(restoreId, context.workspaceState);
-      intentionallyDisposedOpenCodeTerminalRestoreIds.add(restoreId);
+      const terminal = findOpenCodeTerminalByRestoreId(restoreId);
+      const managedTerminal = terminal as ManagedOpenCodeTerminal | undefined;
+      if (managedTerminal) {
+        delete managedTerminal.opencodeRestoreId;
+      }
       terminal?.dispose();
       clearTrackedSession(restoreId);
-      pruneClosedOpenCodeTerminalRestoreInfo(restoreId, context.workspaceState);
     },
   });
   const notifier = new OpenCodeBackgroundNotifier({
@@ -224,14 +195,11 @@ export function activate(context: vscode.ExtensionContext) {
   const sessionEventMonitors = new Map<string, OpenCodeSessionEventMonitor>();
   const trackedSessionStates = new Map<string, RestoreSessionTrackingState>();
   const restoreIdsByOpenCodePort = new Map<number, string>();
-  const restoreInfosByRestoreId = new Map<string, SessionRestoreInfo>();
+  const restoreInfosByRestoreId = new Map<string, TrackedSessionInfo>();
   const latestTuiActivationsByRestoreId = new Map<string, number>();
   const pendingSessionIdValidations = new Set<string>();
   const queuedTitleReconciliations = new Map<string, NodeJS.Timeout>();
   const titleReconciliationAttempts = new Map<string, number>();
-  const restoringOpenCodeTerminalRestoreIds = new Set<string>();
-  const intentionallyDisposedOpenCodeTerminalRestoreIds = new Set<string>();
-  let debugForceGracefulRestoreReuse: boolean | undefined;
   let titleReconciliationQueue: Promise<void> = Promise.resolve();
   const lastMonitorErrorLogAt = new Map<string, number>();
   let notifyTuiActiveSession: (message: TuiSessionActiveMessage) => Promise<boolean> = async () => false;
@@ -351,11 +319,7 @@ export function activate(context: vscode.ExtensionContext) {
       updated: resolution.updated,
     });
 
-    if (!hasTrackedRestoreId(context.workspaceState, restoreId)) {
-      return;
-    }
-
-    const terminal = await findTrackedOpenCodeTerminal(restoreId, context.workspaceState);
+    const terminal = findOpenCodeTerminalByRestoreId(restoreId);
     if (!terminal || terminal.exitStatus !== undefined) {
       return;
     }
@@ -369,42 +333,58 @@ export function activate(context: vscode.ExtensionContext) {
       await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name: targetTerminalName });
     }
 
-    await updatePersistedTerminalTitle(
-      context.workspaceState,
-      restoreId,
-      resolution.terminalName,
-      resolution.sessionLabel,
-      resolution.sessionId,
-      resolution.updated,
-    );
     void refreshReviewSessionMetadata();
   };
   const viewedTerminalStates = new Map<string, Exclude<OpenCodeTerminalLabelState, "running" | "normal">>();
   const enqueueTrackedOpenCodeTitleReconciliation = (restoreId: string) => {
     const next = titleReconciliationQueue
       .catch(() => undefined)
-      .then(() => reconcileTrackedOpenCodeTerminalTitle({
-        restoreId,
-        workspaceState: context.workspaceState,
-        sessionRepository,
-        terminalState: readTrackedOpenCodeTerminalState(notifier, restoreId, viewedTerminalStates),
-      }))
-      .then((result) => {
-        if (result.shouldRetry) {
-          const nextAttempt = (titleReconciliationAttempts.get(restoreId) ?? 0) + 1;
-          if (nextAttempt <= TITLE_RECONCILIATION_RETRY_LIMIT) {
-            titleReconciliationAttempts.set(restoreId, nextAttempt);
-            queueOpenCodeTitleReconciliation(restoreId, TITLE_RECONCILIATION_RETRY_DELAY_MS);
-          }
+      .then(async () => {
+        const terminal = findOpenCodeTerminalByRestoreId(restoreId);
+        if (!terminal || terminal.exitStatus !== undefined) {
           return;
         }
 
-        titleReconciliationAttempts.delete(restoreId);
-        if (result.resolution) {
-          return applyResolvedSessionTitle({ restoreId, resolution: result.resolution });
+        const existingInfo = restoreInfosByRestoreId.get(restoreId);
+        if (!existingInfo) {
+          return;
         }
-      });
-    titleReconciliationQueue = next.catch(() => undefined);
+
+        const sessionId = existingInfo.sessionId;
+        if (!sessionId || !isValidSessionId(sessionId)) {
+          return;
+        }
+
+        const session = await sessionRepository.findSessionByIdAsync(sessionId, existingInfo.cwd);
+        if (!session || session.parentId) {
+          return;
+        }
+
+        const title = session.title?.trim() || existingInfo.sessionLabel || existingInfo.terminalName || sessionId;
+        const terminalState = readTrackedOpenCodeTerminalState(notifier, restoreId, viewedTerminalStates);
+        const targetTerminalName = applyTerminalAttentionLabel(title, terminalState);
+        if (terminal.name !== targetTerminalName) {
+          try {
+            terminal.show(true);
+            await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name: targetTerminalName });
+          } catch {
+            const nextAttempt = (titleReconciliationAttempts.get(restoreId) ?? 0) + 1;
+            if (nextAttempt <= TITLE_RECONCILIATION_RETRY_LIMIT) {
+              titleReconciliationAttempts.set(restoreId, nextAttempt);
+              queueOpenCodeTitleReconciliation(restoreId, TITLE_RECONCILIATION_RETRY_DELAY_MS);
+            }
+            return;
+          }
+        }
+
+        titleReconciliationAttempts.delete(restoreId);
+        await applyResolvedSessionTitle({
+          restoreId,
+          resolution: { terminalName: title, sessionLabel: title, sessionId, updated: session.updated },
+        });
+      })
+      .catch(() => undefined);
+    titleReconciliationQueue = next;
     return next;
   };
   const queueOpenCodeTitleReconciliation = (restoreId: string, delayMs = 250) => {
@@ -419,26 +399,23 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
 
-    void syncTrackedOpenCodeTerminalRestoreId(terminal as ManagedOpenCodeTerminal, context.workspaceState)
-      .then((restoreId) => {
-        if (restoreId) {
-          const currentState = notifier.readSourceState({ restoreId });
-          if (currentState === "permission" || currentState === "error" || currentState === "idle") {
-            viewedTerminalStates.set(restoreId, currentState);
-          }
-          queueOpenCodeTitleReconciliation(restoreId, 0);
-        }
-      }, () => undefined);
+    const managedTerminal = terminal as ManagedOpenCodeTerminal;
+    const restoreId = managedTerminal.opencodeRestoreId;
+    if (restoreId) {
+      const currentState = notifier.readSourceState({ restoreId });
+      if (currentState === "permission" || currentState === "error" || currentState === "idle") {
+        viewedTerminalStates.set(restoreId, currentState);
+      }
+      queueOpenCodeTitleReconciliation(restoreId, 0);
+    }
   };
   const resetOpenCodeTitleReconciliationAttempts = (restoreId: string) => {
     titleReconciliationAttempts.delete(restoreId);
   };
   const isPlausibleTuiActivation = (timestamp: number) => timestamp <= Date.now() + 60_000;
   const queueAllOpenCodeTitleReconciliations = (delayMs = 250) => {
-    for (const restoreInfo of context.workspaceState.get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, [])) {
-      if (restoreInfo.restoreId) {
-        queueOpenCodeTitleReconciliation(restoreInfo.restoreId, delayMs);
-      }
+    for (const restoreId of restoreInfosByRestoreId.keys()) {
+      queueOpenCodeTitleReconciliation(restoreId, delayMs);
     }
   };
   const clearTrackedSession = (restoreId: string) => {
@@ -453,7 +430,16 @@ export function activate(context: vscode.ExtensionContext) {
     disposeOpenCodeSessionEventMonitor(restoreId, sessionEventMonitors);
     resetOpenCodeTitleReconciliationAttempts(restoreId);
   };
-  const confirmTrackedOpenCodeSession = async (restoreInfo: SessionRestoreInfo, session: OpenCodeSessionSummary) => {
+  type TrackedSessionInfo = {
+    restoreId: string;
+    sessionId?: string;
+    sessionLabel?: string;
+    terminalName?: string;
+    cwd?: string;
+    startedAt?: number;
+  };
+
+  const confirmTrackedOpenCodeSession = async (restoreInfo: TrackedSessionInfo, session: OpenCodeSessionSummary) => {
     if (session.parentId || !isValidSessionId(session.id)) {
       return;
     }
@@ -473,8 +459,6 @@ export function activate(context: vscode.ExtensionContext) {
       title,
       updated: session.updated,
     });
-    const nextRestoreInfo = updateRestoreInfoFromSession(restoreInfo, session);
-    restoreInfosByRestoreId.set(restoreInfo.restoreId, nextRestoreInfo);
     sessionPanelProvider.registerSession({
       restoreId: restoreInfo.restoreId,
       sessionId,
@@ -523,72 +507,34 @@ export function activate(context: vscode.ExtensionContext) {
     });
     return result !== "retry";
   };
-  const startTrackedOpenCodeSession = async (
-    launchOptions: SessionRestoreLaunchOptions,
-    relaunchTerminal?: ManagedOpenCodeTerminal,
-  ) => {
-    const startedAt = launchOptions.startedAt ?? Date.now();
+  const startOpenCodeSession = async (options: StartSessionOptions = {}) => {
+    const startedAt = Date.now();
     const normalizedOptions = {
-      ...launchOptions,
+      ...options,
       startedAt,
-      terminalName: launchOptions.terminalName ?? buildOpenCodeTerminalName(launchOptions),
+      terminalName: options.terminalName ?? buildOpenCodeTerminalName(options),
     };
-    const restoreInfo = toSessionRestoreInfo(normalizedOptions);
-    trackedSessionStates.set(restoreInfo.restoreId, createRestoreSessionTrackingState(restoreInfo.sessionId));
-    restoreInfosByRestoreId.set(restoreInfo.restoreId, restoreInfo);
+    const restoreId = createSessionRestoreId();
+    trackedSessionStates.set(restoreId, createRestoreSessionTrackingState(options.sessionId));
     const launch = sessionManager.buildLaunchSpec(process.env, normalizedOptions);
-    let session: ManagedOpenCodeSession;
-    try {
-        session = relaunchTerminal
-          ? await relaunchOpenCodeInTerminal({
-            terminal: relaunchTerminal,
-            launch,
-            existingOpenCodePort: readTrackedOpenCodePort(restoreIdsByOpenCodePort, restoreInfo.restoreId),
-            existingTerminalProcessId: restoreInfo.terminalProcessId,
-            startNewSession: () => sessionManager.startLaunchSpec(launch) as ManagedOpenCodeSession,
-            forceGracefulReuse: debugForceGracefulRestoreReuse,
-          })
-          : sessionManager.startLaunchSpec(launch) as ManagedOpenCodeSession;
-    } catch (error) {
-      trackedSessionStates.delete(restoreInfo.restoreId);
-      restoreInfosByRestoreId.delete(restoreInfo.restoreId);
-      throw error;
-    }
-    deleteOpenCodePortRestoreId(restoreIdsByOpenCodePort, restoreInfo.restoreId);
-    restoreIdsByOpenCodePort.set(session.openCodePort, restoreInfo.restoreId);
-    registerSessionPanelTab(restoreInfo, false);
+    const session = sessionManager.startLaunchSpec(launch) as ManagedOpenCodeSession;
+    restoreIdsByOpenCodePort.set(session.openCodePort, restoreId);
+    registerSessionPanelTab({ restoreId, sessionId: options.sessionId, sessionLabel: options.sessionLabel, terminalName: normalizedOptions.terminalName, cwd: options.cwd, updated: options.updated }, false);
     const managedTerminal = session.terminal;
-    managedTerminal.opencodeRestoreId = restoreInfo.restoreId;
-    await updatePersistedRestoreState(context.workspaceState, (state) => ({
-      ...state,
-      restoreStateEnabled: true,
-      latestRestoreInfo: restoreInfo,
-      restoreInfos: upsertSessionRestoreInfo(state.restoreInfos, restoreInfo),
-      trackedRestoreIds: upsertString(state.trackedRestoreIds, restoreInfo.restoreId),
-    }));
-    void Promise.resolve(managedTerminal.processId)
-      .then((processId) => {
-        if (typeof processId !== "number") {
-          return;
-        }
-
-        managedTerminal.opencodeProcessId = processId;
-        void updatePersistedTerminalProcessId(context.workspaceState, restoreInfo.restoreId, processId);
-      })
-      .catch(() => undefined);
+    managedTerminal.opencodeRestoreId = restoreId;
     const eventMonitor = new OpenCodeSessionEventMonitor({
       port: session.openCodePort,
       onEvent: (event) => {
-        const source = { restoreId: restoreInfo.restoreId };
-        const previousTerminalState = readTrackedOpenCodeTerminalState(notifier, restoreInfo.restoreId, viewedTerminalStates);
+        const source = { restoreId };
+        const previousTerminalState = readTrackedOpenCodeTerminalState(notifier, restoreId, viewedTerminalStates);
         const sessionId = readOpenCodeEventSessionId(event);
         if (sessionId) {
-          const currentState = trackedSessionStates.get(restoreInfo.restoreId) ?? createRestoreSessionTrackingState();
+          const currentState = trackedSessionStates.get(restoreId) ?? createRestoreSessionTrackingState();
           if (currentState.confirmedSessionId === sessionId) {
             notifier.handleEvent(event, source);
-            syncSessionPanelStatus(restoreInfo.restoreId);
-            if (shouldReconcileTitleForEvent(event, previousTerminalState, readTrackedOpenCodeTerminalState(notifier, restoreInfo.restoreId, viewedTerminalStates))) {
-              queueOpenCodeTitleReconciliation(restoreInfo.restoreId, 0);
+            syncSessionPanelStatus(restoreId);
+            if (shouldReconcileTitleForEvent(event, previousTerminalState, readTrackedOpenCodeTerminalState(notifier, restoreId, viewedTerminalStates))) {
+              queueOpenCodeTitleReconciliation(restoreId, 0);
             }
             return;
           }
@@ -596,21 +542,21 @@ export function activate(context: vscode.ExtensionContext) {
           const nextState = queueRestoreSessionCandidate(currentState, sessionId);
             if (nextState === currentState) {
               notifier.handleEvent(event, source);
-              syncSessionPanelStatus(restoreInfo.restoreId);
-              if (shouldReconcileTitleForEvent(event, previousTerminalState, readTrackedOpenCodeTerminalState(notifier, restoreInfo.restoreId, viewedTerminalStates))) {
-                queueOpenCodeTitleReconciliation(restoreInfo.restoreId, 0);
+              syncSessionPanelStatus(restoreId);
+              if (shouldReconcileTitleForEvent(event, previousTerminalState, readTrackedOpenCodeTerminalState(notifier, restoreId, viewedTerminalStates))) {
+                queueOpenCodeTitleReconciliation(restoreId, 0);
               }
               return;
             }
 
-          trackedSessionStates.set(restoreInfo.restoreId, nextState);
-          const validationKey = `${restoreInfo.restoreId}:${sessionId}`;
+          trackedSessionStates.set(restoreId, nextState);
+          const validationKey = `${restoreId}:${sessionId}`;
           if (!pendingSessionIdValidations.has(validationKey)) {
             pendingSessionIdValidations.add(validationKey);
             void Promise.resolve()
-              .then(() => sessionRepository.findSessionByIdAsync(sessionId, restoreInfo.cwd))
+              .then(() => sessionRepository.findSessionByIdAsync(sessionId, options.cwd))
               .then((session) => {
-                const latestState = trackedSessionStates.get(restoreInfo.restoreId);
+                const latestState = trackedSessionStates.get(restoreId);
                 if (!latestState) {
                   return;
                 }
@@ -624,17 +570,17 @@ export function activate(context: vscode.ExtensionContext) {
                 }
 
                 if (session && !session.parentId) {
-                  trackedSessionStates.set(restoreInfo.restoreId, confirmRestoreSessionId(latestState, sessionId));
-                  return confirmTrackedOpenCodeSession(restoreInfo, session);
+                  trackedSessionStates.set(restoreId, confirmRestoreSessionId(latestState, sessionId));
+                  return confirmTrackedOpenCodeSession({ restoreId, sessionId: options.sessionId, sessionLabel: options.sessionLabel, terminalName: normalizedOptions.terminalName, cwd: options.cwd, startedAt }, session);
                 }
 
-                trackedSessionStates.set(restoreInfo.restoreId, discardRestoreSessionCandidate(latestState, sessionId));
+                trackedSessionStates.set(restoreId, discardRestoreSessionCandidate(latestState, sessionId));
                 return undefined;
               })
               .catch(() => {
-                const latestState = trackedSessionStates.get(restoreInfo.restoreId);
+                const latestState = trackedSessionStates.get(restoreId);
                 if (latestState) {
-                  trackedSessionStates.set(restoreInfo.restoreId, discardRestoreSessionCandidate(latestState, sessionId));
+                  trackedSessionStates.set(restoreId, discardRestoreSessionCandidate(latestState, sessionId));
                 }
               })
               .finally(() => {
@@ -643,73 +589,23 @@ export function activate(context: vscode.ExtensionContext) {
           }
         }
         notifier.handleEvent(event, source);
-        syncSessionPanelStatus(restoreInfo.restoreId);
-        if (shouldReconcileTitleForEvent(event, previousTerminalState, readTrackedOpenCodeTerminalState(notifier, restoreInfo.restoreId, viewedTerminalStates))) {
-          queueOpenCodeTitleReconciliation(restoreInfo.restoreId, 0);
+        syncSessionPanelStatus(restoreId);
+        if (shouldReconcileTitleForEvent(event, previousTerminalState, readTrackedOpenCodeTerminalState(notifier, restoreId, viewedTerminalStates))) {
+          queueOpenCodeTitleReconciliation(restoreId, 0);
         }
       },
       onError: (error) => {
-        logThrottledMonitorWarning(lastMonitorErrorLogAt, `monitor:${restoreInfo.restoreId}`, "OpenCode event monitor retrying:", error);
+        logThrottledMonitorWarning(lastMonitorErrorLogAt, `monitor:${restoreId}`, "OpenCode event monitor retrying:", error);
       },
       onMalformedEvent: (error) => {
-        logThrottledMonitorWarning(lastMonitorErrorLogAt, `malformed:${restoreInfo.restoreId}`, "Ignored malformed OpenCode event:", error);
+        logThrottledMonitorWarning(lastMonitorErrorLogAt, `malformed:${restoreId}`, "Ignored malformed OpenCode event:", error);
       },
     });
-    sessionEventMonitors.get(restoreInfo.restoreId)?.dispose();
-    sessionEventMonitors.set(restoreInfo.restoreId, eventMonitor);
+    sessionEventMonitors.get(restoreId)?.dispose();
+    sessionEventMonitors.set(restoreId, eventMonitor);
     eventMonitor.start();
-    resetOpenCodeTitleReconciliationAttempts(restoreInfo.restoreId);
-    queueOpenCodeTitleReconciliation(restoreInfo.restoreId, 0);
-  };
-  const startOpenCodeSession = async (options: SessionRestoreLaunchOptions = {}) => {
-    await startTrackedOpenCodeSession(options);
-  };
-  const restoreOpenCodeSession = async () => {
-    const persistedRestoreInfos = context.workspaceState.get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, []);
-    const legacyRestoreInfo = context.workspaceState.get<PersistedSessionRestoreInfo>(SESSION_RESTORE_INFO_KEY);
-    const hasRestoredTerminal = await waitForOpenCodeTerminalRestore(() => hasOpenCodeTerminal(context.workspaceState));
-    if (shouldClearRestoreStateAfterMissingTerminal(hasRestoredTerminal, persistedRestoreInfos, legacyRestoreInfo)) {
-      await updatePersistedRestoreState(context.workspaceState, () => ({
-        restoreStateEnabled: false,
-        latestRestoreInfo: undefined,
-        restoreInfos: [],
-        trackedRestoreIds: [],
-      }));
-      disposeAllOpenCodeSessionEventMonitors(sessionEventMonitors);
-      return;
-    }
-
-    const restoreInfos = readSessionRestoreInfos(
-      persistedRestoreInfos,
-      legacyRestoreInfo,
-    );
-    disposeAllOpenCodeSessionEventMonitors(sessionEventMonitors);
-    for (const restoreInfo of restoreInfos) {
-      try {
-        const trackedTerminal = restoreInfo.restoreId
-          ? await findTrackedOpenCodeTerminal(restoreInfo.restoreId, context.workspaceState)
-          : undefined;
-        const restorableTerminal = trackedTerminal && canRelaunchOpenCodeInTerminal(trackedTerminal)
-          ? trackedTerminal
-          : restoreInfo.restoreId
-            ? await waitForTrackedOpenCodeTerminal(restoreInfo.restoreId, context.workspaceState, canRelaunchOpenCodeInTerminal)
-            : undefined;
-        if (trackedTerminal && !restorableTerminal && restoreInfo.restoreId) {
-          restoringOpenCodeTerminalRestoreIds.add(restoreInfo.restoreId);
-          intentionallyDisposedOpenCodeTerminalRestoreIds.add(restoreInfo.restoreId);
-          trackedTerminal.dispose();
-        }
-        await startTrackedOpenCodeSession(
-          await resolveRestoredSessionLaunchOptions(sessionRepository, restoreInfo),
-          restorableTerminal,
-        );
-      } finally {
-        if (restoreInfo.restoreId) {
-          restoringOpenCodeTerminalRestoreIds.delete(restoreInfo.restoreId);
-        }
-      }
-    }
-    queueAllOpenCodeTitleReconciliations();
+    resetOpenCodeTitleReconciliationAttempts(restoreId);
+    queueOpenCodeTitleReconciliation(restoreId, 0);
   };
   context.subscriptions.push(
     bridgeServer,
@@ -730,12 +626,10 @@ export function activate(context: vscode.ExtensionContext) {
     },
     vscode.window.onDidChangeWindowState((state) => notifier.setFocused(state.focused)),
     vscode.window.onDidOpenTerminal((terminal) => {
-      void syncTrackedOpenCodeTerminalRestoreId(terminal as ManagedOpenCodeTerminal, context.workspaceState)
-        .then((restoreId) => {
-          if (restoreId) {
-            queueOpenCodeTitleReconciliation(restoreId, 0);
-          }
-        }, () => undefined);
+      const restoreId = (terminal as ManagedOpenCodeTerminal).opencodeRestoreId;
+      if (restoreId) {
+        queueOpenCodeTitleReconciliation(restoreId, 0);
+      }
     }),
     vscode.window.onDidChangeActiveTerminal((terminal) => {
       if (!terminal) {
@@ -743,27 +637,24 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const terminalAtRequest = terminal;
       clearTerminalAttentionForActiveTerminal(terminal);
-      void syncTrackedOpenCodeTerminalRestoreId(terminal as ManagedOpenCodeTerminal, context.workspaceState)
-        .then((restoreId) => {
-          const selection = resolveActiveSessionPanelSelection({
-            terminalAtRequest,
-            activeTerminal: vscode.window.activeTerminal,
-            restoreId,
-          });
+      const restoreId = (terminal as ManagedOpenCodeTerminal).opencodeRestoreId;
+      const selection = resolveActiveSessionPanelSelection({
+        terminalAtRequest: terminal,
+        activeTerminal: vscode.window.activeTerminal,
+        restoreId,
+      });
 
-          switch (selection.type) {
-            case "ignore":
-              return;
-            case "select":
-              sessionPanelProvider.selectSession(selection.restoreId);
-              return;
-            case "clear":
-              sessionPanelProvider.clearSelection();
-              return;
-          }
-        }, () => undefined);
+      switch (selection.type) {
+        case "ignore":
+          return;
+        case "select":
+          sessionPanelProvider.selectSession(selection.restoreId);
+          return;
+        case "clear":
+          sessionPanelProvider.clearSelection();
+          return;
+      }
     }),
     vscode.window.onDidChangeActiveTextEditor(() => {
       if (vscode.window.activeTerminal) {
@@ -773,20 +664,16 @@ export function activate(context: vscode.ExtensionContext) {
       sessionPanelProvider.clearSelection();
     }),
     vscode.window.onDidChangeTerminalState((terminal) => {
-      void syncTrackedOpenCodeTerminalRestoreId(terminal as ManagedOpenCodeTerminal, context.workspaceState)
-        .then((restoreId) => {
-          if (restoreId) {
-            queueOpenCodeTitleReconciliation(restoreId);
-          }
-        }, () => undefined);
+      const restoreId = (terminal as ManagedOpenCodeTerminal).opencodeRestoreId;
+      if (restoreId) {
+        queueOpenCodeTitleReconciliation(restoreId);
+      }
     }),
     vscode.window.onDidChangeTerminalShellIntegration(({ terminal }) => {
-      void syncTrackedOpenCodeTerminalRestoreId(terminal as ManagedOpenCodeTerminal, context.workspaceState)
-        .then((restoreId) => {
-          if (restoreId) {
-            queueOpenCodeTitleReconciliation(restoreId, 0);
-          }
-        }, () => undefined);
+      const restoreId = (terminal as ManagedOpenCodeTerminal).opencodeRestoreId;
+      if (restoreId) {
+        queueOpenCodeTitleReconciliation(restoreId, 0);
+      }
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("opencodeEdit.notifications")) {
@@ -796,7 +683,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       "opencodeEdit.startSession",
       createStartOpenCodeSessionCommand({
-        startSession: (options?: SessionRestoreLaunchOptions) => startOpenCodeSession(options),
+        startSession: (options?: StartSessionOptions) => startOpenCodeSession(options),
         waitUntilReady: () => bridgeServer.waitUntilReady(),
       }, {
         prepareLayout: () => prepareSideBySideEditorLayout((command, ...args) => vscode.commands.executeCommand(command, ...args)),
@@ -889,45 +776,21 @@ export function activate(context: vscode.ExtensionContext) {
       restoreIdsByOpenCodePort,
       syncSessionPanelStatus,
       startSession: (options) => startOpenCodeSession(options),
-      restoreSession: () => restoreOpenCodeSession(),
-      setForceGracefulRestoreReuse: (value) => {
-        debugForceGracefulRestoreReuse = value;
-      },
       sessionRepository,
       reviewQueueStore,
       reviewPanelProvider,
       sessionPanelProvider,
     }),
-    vscode.window.onDidCloseTerminal((terminal) => {
-      void (async () => {
-        const managedTerminal = terminal as ManagedOpenCodeTerminal;
-        const restoreId = await resolveManagedOpenCodeTerminalRestoreId(managedTerminal, context.workspaceState);
+vscode.window.onDidCloseTerminal((terminal) => {
+      const managedTerminal = terminal as ManagedOpenCodeTerminal;
+      const restoreId = managedTerminal.opencodeRestoreId;
+      if (!restoreId) {
+        return;
+      }
 
-        if (!restoreId) {
-          return;
-        }
-
-        if (restoringOpenCodeTerminalRestoreIds.has(restoreId)) {
-          intentionallyDisposedOpenCodeTerminalRestoreIds.delete(restoreId);
-          return;
-        }
-
-        const wasIntentionallyDisposed = intentionallyDisposedOpenCodeTerminalRestoreIds.delete(restoreId);
-        clearTrackedSession(restoreId);
-        if (!wasIntentionallyDisposed) {
-          pruneClosedOpenCodeTerminalRestoreInfo(restoreId, context.workspaceState);
-        }
-    })().catch(() => undefined);
-  }),
+      clearTrackedSession(restoreId);
+    }),
   );
-
-  if (context.workspaceState.get<boolean>(SESSION_RESTORE_STATE_KEY) === true) {
-    void bridgeServer.waitUntilReady().then(() => {
-      return restoreOpenCodeSession();
-    }, (error) => {
-      void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
-    });
-  }
 }
 
 export function deactivate() {}
@@ -1013,8 +876,6 @@ function createDebugCommandRegistrations({
   restoreIdsByOpenCodePort,
   syncSessionPanelStatus,
   startSession,
-  restoreSession,
-  setForceGracefulRestoreReuse,
   sessionRepository,
   reviewQueueStore,
   reviewPanelProvider,
@@ -1026,9 +887,7 @@ function createDebugCommandRegistrations({
   sessionManager: OpenCodeSessionManager;
   restoreIdsByOpenCodePort: Map<number, string>;
   syncSessionPanelStatus(restoreId: string): void;
-  startSession(options?: SessionRestoreLaunchOptions): Promise<void>;
-  restoreSession(): Promise<void>;
-  setForceGracefulRestoreReuse(value: boolean | undefined): void;
+  startSession(options?: StartSessionOptions): Promise<void>;
   sessionRepository: OpenCodeSessionRepository;
   reviewQueueStore: ReviewQueueStore;
   reviewPanelProvider: ReviewPanelProvider;
@@ -1079,7 +938,7 @@ function createDebugCommandRegistrations({
     ),
     vscode.commands.registerCommand(
       "opencodeEdit.debug.startOpenCodeSession",
-      async (options?: SessionRestoreLaunchOptions) => {
+      async (options?: StartSessionOptions) => {
         await startSession(options);
         return sessionPanelProvider.getState();
       },
@@ -1113,19 +972,6 @@ function createDebugCommandRegistrations({
           throw new Error("TUI session activation was not accepted.");
         }
         return sessionPanelProvider.getState();
-      },
-    ),
-    vscode.commands.registerCommand(
-      "opencodeEdit.debug.restoreOpenCodeSession",
-      async () => {
-        await restoreSession();
-        return sessionPanelProvider.getState();
-      },
-    ),
-    vscode.commands.registerCommand(
-      "opencodeEdit.debug.setForceGracefulRestoreReuse",
-      (value?: boolean) => {
-        setForceGracefulRestoreReuse(typeof value === "boolean" ? value : undefined);
       },
     ),
     vscode.commands.registerCommand(
@@ -1169,294 +1015,12 @@ function createDebugCommandRegistrations({
   ];
 }
 
-async function hasOpenCodeTerminal(workspaceState: vscode.Memento) {
-  const matcher = readOpenCodeTerminalMatcher(workspaceState);
-  for (const terminal of vscode.window.terminals) {
-    if (await isOpenCodeTerminal(terminal as ManagedOpenCodeTerminal, matcher, workspaceState)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function readOpenCodeTerminalMatcher(workspaceState: vscode.Memento) {
-  return createOpenCodeTerminalMatcher(
-    workspaceState.get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, []),
-    workspaceState.get<PersistedSessionRestoreInfo>(SESSION_RESTORE_INFO_KEY),
-    workspaceState.get<string[]>(OPENCODE_TERMINAL_RESTORE_IDS_KEY, []),
-  );
-}
-
-async function isOpenCodeTerminal(
-  terminal: ManagedOpenCodeTerminal,
-  matcher: ReturnType<typeof readOpenCodeTerminalMatcher>,
-  workspaceState: vscode.Memento,
-) {
-  if (terminal.opencodeDetachedFromRestore) {
-    return false;
-  }
-
-  if (matchesOpenCodeTerminal({ name: terminal.name, restoreId: terminal.opencodeRestoreId }, matcher)) {
-    return true;
-  }
-
-  const restoreId = resolveOpenCodeTerminalRestoreId(
-    {
-      name: terminal.name,
-      restoreId: terminal.opencodeRestoreId,
-      creationName: readTerminalCreationName(terminal.creationOptions),
-      cwd: readTerminalCreationCwd(terminal.creationOptions),
-    },
-    workspaceState.get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, []),
-    workspaceState.get<PersistedSessionRestoreInfo>(SESSION_RESTORE_INFO_KEY),
-  );
-  if (restoreId) {
-    terminal.opencodeRestoreId = restoreId;
-    return true;
-  }
-
-  const processId = await readResolvedTerminalProcessId(terminal);
-  return matchesOpenCodeTerminal({
-    name: terminal.name,
-    restoreId: terminal.opencodeRestoreId,
-    processId,
-    creationName: readTerminalCreationName(terminal.creationOptions),
-    cwd: readTerminalCreationCwd(terminal.creationOptions),
-  }, matcher);
-}
-
-async function resolveManagedOpenCodeTerminalRestoreId(
-  terminal: ManagedOpenCodeTerminal,
-  workspaceState: vscode.Memento,
-) {
-  if (terminal.opencodeDetachedFromRestore) {
-    return undefined;
-  }
-
-  if (terminal.opencodeRestoreId && hasTrackedRestoreId(workspaceState, terminal.opencodeRestoreId)) {
-    return terminal.opencodeRestoreId;
-  }
-
-  const restoreId = resolveOpenCodeTerminalRestoreId(
-    {
-      name: terminal.name,
-      restoreId: terminal.opencodeRestoreId,
-      processId: await readResolvedTerminalProcessId(terminal),
-      creationName: readTerminalCreationName(terminal.creationOptions),
-      cwd: readTerminalCreationCwd(terminal.creationOptions),
-    },
-    workspaceState.get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, []),
-    workspaceState.get<PersistedSessionRestoreInfo>(SESSION_RESTORE_INFO_KEY),
-  );
-
-  if (restoreId && !terminal.opencodeRestoreId) {
-    terminal.opencodeRestoreId = restoreId;
-  }
-
-  return restoreId;
-}
-
-async function syncTrackedOpenCodeTerminalRestoreId(
-  terminal: ManagedOpenCodeTerminal,
-  workspaceState: vscode.Memento,
-) {
-  const restoreId = await resolveManagedOpenCodeTerminalRestoreId(terminal, workspaceState);
-  if (!restoreId || !hasTrackedRestoreId(workspaceState, restoreId)) {
-    return undefined;
-  }
-
-  return restoreId;
-}
-
-async function findTrackedOpenCodeTerminal(
-  restoreId: string,
-  workspaceState: vscode.Memento,
-) {
+function findOpenCodeTerminalByRestoreId(restoreId: string): ManagedOpenCodeTerminal | undefined {
   for (const terminal of vscode.window.terminals) {
     const managedTerminal = terminal as ManagedOpenCodeTerminal;
-    if (await resolveManagedOpenCodeTerminalRestoreId(managedTerminal, workspaceState) === restoreId) {
+    if (managedTerminal.opencodeRestoreId === restoreId) {
       return managedTerminal;
     }
-  }
-
-  return undefined;
-}
-
-async function waitForTrackedOpenCodeTerminal(
-  restoreId: string,
-  workspaceState: vscode.Memento,
-  isReady: (terminal: ManagedOpenCodeTerminal) => boolean = () => true,
-) {
-  let terminal = await findTrackedOpenCodeTerminal(restoreId, workspaceState);
-  if (terminal && isReady(terminal)) {
-    return terminal;
-  }
-
-  await waitForOpenCodeTerminalRestore(async () => {
-    terminal = await findTrackedOpenCodeTerminal(restoreId, workspaceState);
-    return !!terminal && isReady(terminal);
-  });
-  return terminal && isReady(terminal) ? terminal : undefined;
-}
-
-function revealOpenCodeSessionByRestoreId(workspaceState: vscode.Memento, restoreId: string) {
-  void (async () => {
-    const terminal = await waitForTrackedOpenCodeTerminal(restoreId, workspaceState);
-    if (terminal) {
-      terminal.show(false);
-    }
-  })().catch(() => undefined);
-}
-
-async function relaunchOpenCodeInTerminal({
-  terminal,
-  launch,
-  existingOpenCodePort,
-  existingTerminalProcessId,
-  startNewSession,
-  forceGracefulReuse,
-}: {
-  terminal: ManagedOpenCodeTerminal;
-  launch: ReturnType<OpenCodeSessionManager["buildLaunchSpec"]>;
-  existingOpenCodePort?: number;
-  existingTerminalProcessId?: number;
-  startNewSession: () => ManagedOpenCodeSession;
-  forceGracefulReuse?: boolean;
-}): Promise<ManagedOpenCodeSession> {
-  const shell = readOpenCodeTerminalShell(terminal);
-  const commandLine = buildOpenCodeRelaunchCommand(launch.command, launch.env, shell);
-  terminal.show(true);
-
-  const shellIntegration = terminal.shellIntegration;
-  if (!shellIntegration) {
-    throw new Error("Restored terminal is not ready for shell-integrated relaunch.");
-  }
-
-  const gracefullyTerminated = forceGracefulReuse ?? await tryTerminateExistingOpenCodeProcessForReuse({
-    existingOpenCodePort,
-    terminal,
-  });
-  if (gracefullyTerminated) {
-    shellIntegration.executeCommand(commandLine);
-
-    return {
-      terminal,
-      openCodePort: launch.openCodePort,
-    };
-  }
-
-  retireManagedOpenCodeTerminal(terminal);
-  await terminateExistingOpenCodeProcess({
-    existingOpenCodePort,
-    existingTerminalProcessId,
-  });
-  return startNewSession();
-}
-
-function detachManagedOpenCodeTerminalFromRestore(terminal: ManagedOpenCodeTerminal) {
-  delete terminal.opencodeRestoreId;
-  terminal.opencodeDetachedFromRestore = true;
-}
-
-function retireManagedOpenCodeTerminal(terminal: ManagedOpenCodeTerminal) {
-  detachManagedOpenCodeTerminalFromRestore(terminal);
-  terminal.dispose();
-}
-
-async function terminateExistingOpenCodeProcess({
-  existingOpenCodePort,
-  existingTerminalProcessId,
-}: {
-  existingOpenCodePort?: number;
-  existingTerminalProcessId?: number;
-}) {
-  if (process.platform === "win32") {
-    return;
-  }
-
-  if (typeof existingTerminalProcessId === "number") {
-    spawnSync("kill", ["-TERM", String(existingTerminalProcessId)], {
-      stdio: "ignore",
-    });
-    await wait(150);
-  }
-
-  if (existingOpenCodePort) {
-    signalOpenCodeProcess(existingOpenCodePort, "KILL");
-    await wait(150);
-  }
-}
-
-function canRelaunchOpenCodeInTerminal(terminal: ManagedOpenCodeTerminal | undefined): terminal is ManagedOpenCodeTerminal {
-  if (!terminal || terminal.exitStatus !== undefined || !terminal.shellIntegration) {
-    return false;
-  }
-
-  return terminal.state.shell !== undefined || readTerminalShellPath(terminal.creationOptions) !== undefined;
-}
-
-function readTrackedOpenCodePort(portMap: Map<number, string>, restoreId: string) {
-  for (const [port, candidateRestoreId] of portMap) {
-    if (candidateRestoreId === restoreId) {
-      return port;
-    }
-  }
-
-  return undefined;
-}
-
-function readOpenCodeTerminalShell(terminal: ManagedOpenCodeTerminal): OpenCodeTerminalShell {
-  const shell = terminal.state.shell?.toLowerCase();
-  if (shell === "cmd") {
-    return "cmd";
-  }
-
-  if (shell === "pwsh" || shell === "powershell") {
-    return "powershell";
-  }
-
-  const shellPath = readTerminalShellPath(terminal.creationOptions);
-  if (shellPath?.includes("cmd.exe") || shellPath?.endsWith("\\cmd")) {
-    return "cmd";
-  }
-
-  if (shellPath?.includes("powershell") || shellPath?.includes("pwsh")) {
-    return "powershell";
-  }
-
-  return "posix";
-}
-
-function readTerminalShellPath(
-  creationOptions: Readonly<vscode.TerminalOptions | vscode.ExtensionTerminalOptions> | undefined,
-) {
-  const candidate = creationOptions as { shellPath?: unknown } | undefined;
-  return typeof candidate?.shellPath === "string"
-    ? candidate.shellPath.toLowerCase()
-    : undefined;
-}
-
-function readTerminalCreationName(
-  creationOptions: Readonly<vscode.TerminalOptions | vscode.ExtensionTerminalOptions> | undefined,
-) {
-  const candidate = creationOptions as { name?: unknown } | undefined;
-  return typeof candidate?.name === "string" ? candidate.name : undefined;
-}
-
-function readTerminalCreationCwd(
-  creationOptions: Readonly<vscode.TerminalOptions | vscode.ExtensionTerminalOptions> | undefined,
-) {
-  const candidate = creationOptions as { cwd?: unknown } | undefined;
-  const cwd = candidate?.cwd;
-  if (typeof cwd === "string") {
-    return cwd;
-  }
-
-  if (cwd && typeof cwd === "object" && "fsPath" in cwd) {
-    return typeof (cwd as { fsPath?: unknown }).fsPath === "string"
-      ? (cwd as { fsPath: string }).fsPath
-      : undefined;
   }
 
   return undefined;
@@ -1531,30 +1095,32 @@ function disposeAllQueuedOpenCodeTitleReconciliations(timeouts: Map<string, Node
   timeouts.clear();
 }
 
-function pathExists(path: string) {
-  return vscode.workspace.fs.stat(vscode.Uri.file(path)).then(
-    () => true,
-    () => false,
-  );
+function tryConvertWslPathToWindows(wslPath: string): string | undefined {
+  const match = wslPath.match(/^\/mnt\/([a-zA-Z])\/(.+)$/);
+  if (!match) {
+    return undefined;
+  }
+  const driveLetter = match[1].toUpperCase();
+  const rest = match[2].replace(/\//g, "\\");
+  return `${driveLetter}:\\${rest}`;
 }
 
-function pruneClosedOpenCodeTerminalRestoreInfo(
-  restoreId: string,
-  workspaceState: vscode.Memento,
-) {
-  void updatePersistedRestoreState(workspaceState, (state) => {
-    const nextRestoreInfos = removeSessionRestoreInfo(state.restoreInfos, restoreId);
-    const latestRestoreInfo = state.latestRestoreInfo?.restoreId === restoreId
-      ? nextRestoreInfos.at(-1)
-      : state.latestRestoreInfo;
-    return {
-      ...state,
-      restoreStateEnabled: nextRestoreInfos.length > 0,
-      latestRestoreInfo,
-      restoreInfos: nextRestoreInfos,
-      trackedRestoreIds: state.trackedRestoreIds.filter((item: string) => item !== restoreId),
-    };
-  });
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(vscode.Uri.file(path));
+    return true;
+  } catch {
+    const windowsPath = tryConvertWslPathToWindows(path);
+    if (windowsPath) {
+      try {
+        await vscode.workspace.fs.stat(vscode.Uri.file(windowsPath));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
 }
 
 function upsertString(existing: string[], value: string) {
@@ -1569,70 +1135,7 @@ function deleteOpenCodePortRestoreId(portMap: Map<number, string>, restoreId: st
   }
 }
 
-function hasTrackedRestoreId(workspaceState: vscode.Memento, restoreId: string) {
-  return workspaceState.get<string[]>(OPENCODE_TERMINAL_RESTORE_IDS_KEY, []).includes(restoreId);
-}
 
-async function reconcileTrackedOpenCodeTerminalTitle({
-  restoreId,
-  workspaceState,
-  sessionRepository,
-  terminalState,
-}: {
-  restoreId: string;
-  workspaceState: vscode.Memento;
-  sessionRepository: OpenCodeSessionRepository;
-  terminalState: OpenCodeTerminalLabelState;
-}) {
-  if (!hasTrackedRestoreId(workspaceState, restoreId)) {
-    return { shouldRetry: false };
-  }
-
-  const restoreInfo = workspaceState
-    .get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, [])
-    .find((info) => info.restoreId === restoreId);
-  if (!restoreInfo) {
-    return { shouldRetry: false };
-  }
-
-  const terminal = await findTrackedOpenCodeTerminal(restoreId, workspaceState);
-  if (!terminal || terminal.exitStatus !== undefined) {
-    return { shouldRetry: false };
-  }
-
-  const resolved = await resolveTrackedOpenCodeSessionTitle(sessionRepository, restoreInfo);
-  const shouldRetry = shouldRetryTrackedOpenCodeTitleReconciliation(restoreInfo, resolved);
-  const targetTerminalName = applyTerminalAttentionLabel(resolved.resolution.terminalName, terminalState);
-
-    if (terminal.name === targetTerminalName && restoreInfo.terminalName === resolved.resolution.terminalName) {
-      if (
-        resolved.resolution.sessionId
-        && restoreInfo.sessionId === resolved.resolution.sessionId
-        && restoreInfo.updated === resolved.resolution.updated
-      ) {
-        return { shouldRetry: false };
-      }
-    }
-
-  if (terminal.name !== targetTerminalName) {
-    try {
-      terminal.show(true);
-      await vscode.commands.executeCommand("workbench.action.terminal.renameWithArg", { name: targetTerminalName });
-    } catch {
-      return { shouldRetry };
-    }
-  }
-
-  await updatePersistedTerminalTitle(
-    workspaceState,
-    restoreId,
-    resolved.resolution.terminalName,
-    resolved.resolution.sessionLabel,
-    resolved.resolution.sessionId,
-    resolved.resolution.updated,
-  );
-  return { shouldRetry, resolution: resolved.resolution };
-}
 
 function readTrackedOpenCodeTerminalState(
   notifier: OpenCodeBackgroundNotifier,
@@ -1666,164 +1169,11 @@ function toSessionPanelStatus(state: OpenCodeSourceState): OpenCodeSessionTabSta
   }
 }
 
-async function resolveTrackedOpenCodeSessionTitle(
-  sessionRepository: OpenCodeSessionRepository,
-  restoreInfo: PersistedSessionRestoreInfo,
-) {
-  const exactSession = restoreInfo.sessionId && isValidSessionId(restoreInfo.sessionId)
-    ? await sessionRepository.findSessionByIdAsync(restoreInfo.sessionId, restoreInfo.cwd)
-    : undefined;
-  const restorableExactSession = exactSession && !exactSession.parentId ? exactSession : undefined;
-  const latestSession = restorableExactSession?.title?.trim()
-    ? undefined
-    : await readLatestTrackedSession(sessionRepository, restoreInfo);
-  return {
-    resolution: resolveSessionTitle(restoreInfo, { exactSession, latestSession }),
-    exactSessionTitle: restorableExactSession?.title?.trim(),
-  };
-}
 
-async function readLatestTrackedSession(
-  sessionRepository: OpenCodeSessionRepository,
-  restoreInfo: PersistedSessionRestoreInfo,
-) {
-  const sessionLabel = restoreInfo.sessionLabel?.trim();
-    if (sessionLabel) {
-      const latestSession = await sessionRepository.findLatestSessionByTitleAsync(sessionLabel, restoreInfo.cwd);
-      if (latestSession) {
-        return latestSession;
-      }
-  }
 
-  if (!restoreInfo.cwd || typeof restoreInfo.startedAt !== "number") {
-    return undefined;
-  }
 
-  return readLatestSessionForDirectory(await sessionRepository.listSessionsAsync(restoreInfo.cwd), restoreInfo.cwd, restoreInfo.startedAt);
-}
 
-function shouldRetryTrackedOpenCodeTitleReconciliation(
-  restoreInfo: PersistedSessionRestoreInfo,
-  resolved: Awaited<ReturnType<typeof resolveTrackedOpenCodeSessionTitle>>,
-) {
-  return shouldRetrySessionTitleResolution(restoreInfo, resolved.resolution.terminalName, resolved.exactSessionTitle);
-}
 
-async function resolveRestoredSessionLaunchOptions(
-  sessionRepository: OpenCodeSessionRepository,
-  restoreInfo: PersistedSessionRestoreInfo,
-): Promise<SessionRestoreLaunchOptions> {
-  const exactSession = restoreInfo.sessionId
-    ? await sessionRepository.findSessionByIdAsync(restoreInfo.sessionId, restoreInfo.cwd)
-    : undefined;
-  const latestSession = await readLatestTrackedSession(sessionRepository, restoreInfo);
-
-  return resolveRestoreSessionOptions(restoreInfo, { exactSession, latestSession });
-}
-
-async function updatePersistedTerminalTitle(
-  workspaceState: vscode.Memento,
-  restoreId: string,
-  terminalName: string,
-  sessionLabel?: string,
-  sessionId?: string,
-  updated?: number | string,
-) {
-  const hasUpdated = arguments.length >= 6;
-  await updatePersistedRestoreState(workspaceState, (state) => ({
-    ...state,
-    latestRestoreInfo: state.latestRestoreInfo?.restoreId === restoreId
-      ? {
-        ...state.latestRestoreInfo,
-        terminalName,
-        ...(sessionLabel ? { sessionLabel } : {}),
-        ...(sessionId ? { sessionId } : {}),
-        ...(hasUpdated ? { updated } : {}),
-      }
-      : state.latestRestoreInfo,
-    restoreInfos: updateSessionRestoreInfo(
-      state.restoreInfos,
-      restoreId,
-      (info) => ({
-        ...info,
-        terminalName,
-        ...(sessionLabel ? { sessionLabel } : {}),
-        ...(sessionId ? { sessionId } : {}),
-        ...(hasUpdated ? { updated } : {}),
-      }),
-    ),
-  }));
-}
-
-async function updatePersistedTerminalProcessId(
-  workspaceState: vscode.Memento,
-  restoreId: string,
-  terminalProcessId: number,
-) {
-  await updatePersistedRestoreState(workspaceState, (state) => ({
-    ...state,
-    latestRestoreInfo: state.latestRestoreInfo?.restoreId === restoreId
-      ? { ...state.latestRestoreInfo, terminalProcessId }
-      : state.latestRestoreInfo,
-    restoreInfos: updateSessionRestoreInfo(
-      state.restoreInfos,
-      restoreId,
-      (info) => ({
-        ...info,
-        terminalProcessId,
-      }),
-    ),
-  }));
-}
-
-async function readResolvedTerminalProcessId(terminal: ManagedOpenCodeTerminal) {
-  if (typeof terminal.opencodeProcessId === "number") {
-    return terminal.opencodeProcessId;
-  }
-
-  const processId = await terminal.processId;
-  if (typeof processId === "number") {
-    terminal.opencodeProcessId = processId;
-  }
-  return processId;
-}
-
-function wait(durationMs: number) {
-  return new Promise((resolve) => setTimeout(resolve, durationMs));
-}
-
-let updatePersistedRestoreState = async (
-  workspaceState: vscode.Memento,
-  update: (state: PersistedRestoreState) => PersistedRestoreState,
-) => {
-  const nextWrite = restoreStateWrite
-    .catch(() => undefined)
-    .then(async () => {
-    const currentState: PersistedRestoreState = {
-      restoreStateEnabled: workspaceState.get<boolean>(SESSION_RESTORE_STATE_KEY) === true,
-      latestRestoreInfo: workspaceState.get<PersistedSessionRestoreInfo>(SESSION_RESTORE_INFO_KEY),
-      restoreInfos: workspaceState.get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, []),
-      trackedRestoreIds: workspaceState.get<string[]>(OPENCODE_TERMINAL_RESTORE_IDS_KEY, []),
-    };
-    const snapshot = updatePersistedRestoreStateSnapshot(currentState, update);
-    const writes: Thenable<void>[] = [];
-    if (snapshot.shouldWriteRestoreStateEnabled) {
-      writes.push(workspaceState.update(SESSION_RESTORE_STATE_KEY, snapshot.nextState.restoreStateEnabled));
-    }
-    if (snapshot.shouldWriteLatestRestoreInfo) {
-      writes.push(workspaceState.update(SESSION_RESTORE_INFO_KEY, snapshot.nextState.latestRestoreInfo));
-    }
-    if (snapshot.shouldWriteRestoreInfos) {
-      writes.push(workspaceState.update(SESSION_RESTORE_LIST_KEY, snapshot.nextState.restoreInfos));
-    }
-    if (snapshot.shouldWriteTrackedRestoreIds) {
-      writes.push(workspaceState.update(OPENCODE_TERMINAL_RESTORE_IDS_KEY, snapshot.nextState.trackedRestoreIds));
-    }
-    await Promise.all(writes);
-  });
-  restoreStateWrite = nextWrite.catch(() => undefined);
-  await nextWrite;
-};
 
 function createCommandDeps() {
   return {
@@ -2157,35 +1507,12 @@ function readPersistedApplyPatchFailureRecords(context: vscode.ExtensionContext)
   return readApplyPatchFailureRecords(context.workspaceState.get<ApplyPatchFailureRecord[]>(APPLY_PATCH_FAILURE_RECORDS_KEY));
 }
 
-function readReviewSessionMetadataFromWorkspaceState(workspaceState: vscode.Memento): ReviewSessionMetadata {
-  const sessionTitlesById: Record<string, string> = {};
-  const sessionCanonicalIdsById: Record<string, string> = {};
-  for (const restoreInfo of workspaceState.get<PersistedSessionRestoreInfo[]>(SESSION_RESTORE_LIST_KEY, [])) {
-    const sessionId = restoreInfo.sessionId;
-    if (typeof sessionId !== "string" || !isValidSessionId(sessionId)) {
-      continue;
-    }
-
-    sessionCanonicalIdsById[sessionId] = sessionId;
-    const title = restoreInfo.sessionLabel?.trim() || restoreInfo.terminalName?.trim();
-    if (title) {
-      sessionTitlesById[sessionId] = title;
-    }
-  }
-
-  const latestRestoreInfo = workspaceState.get<PersistedSessionRestoreInfo>(SESSION_RESTORE_INFO_KEY);
-  const latestSessionId = latestRestoreInfo?.sessionId;
-  if (latestRestoreInfo && typeof latestSessionId === "string" && isValidSessionId(latestSessionId)) {
-    sessionCanonicalIdsById[latestSessionId] = latestSessionId;
-    const title = latestRestoreInfo.sessionLabel?.trim() || latestRestoreInfo.terminalName?.trim();
-    if (title) {
-      sessionTitlesById[latestSessionId] = title;
-    }
-  }
-
+function readReviewSessionMetadataFromWorkspaceState(_workspaceState: vscode.Memento): ReviewSessionMetadata {
+  // Persistence-based restore state removed; return empty metadata
+  // Session titles are now sourced from the runtime restoreInfosByRestoreId map
   return {
-    sessionTitlesById,
-    sessionCanonicalIdsById,
+    sessionTitlesById: {},
+    sessionCanonicalIdsById: {},
   };
 }
 

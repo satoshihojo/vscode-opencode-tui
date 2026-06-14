@@ -56,4 +56,39 @@ describe("OpenCode session panel messages", () => {
     assert.equal(markedRestoreId, "restore-2");
     assert.equal(revealedRestoreId, "restore-2");
   });
+
+  it("closes session rows and invokes the close action", () => {
+    let closedRestoreId: string | undefined;
+    const state: OpenCodeSessionTabState = {
+      selectedRestoreId: "restore-1",
+      order: ["restore-1", "restore-2"],
+      tabsByRestoreId: {
+        "restore-1": {
+          restoreId: "restore-1",
+          title: "One",
+          status: "idle",
+          hidden: false,
+          unread: false,
+        },
+        "restore-2": {
+          restoreId: "restore-2",
+          title: "Two",
+          status: "running",
+          hidden: false,
+          unread: false,
+        },
+      },
+    };
+
+    const nextState = handleOpenCodeSessionPanelMessage(state, { type: "close", restoreId: "restore-1" }, {
+      closeSession: (restoreId) => {
+        closedRestoreId = restoreId;
+      },
+    });
+
+    assert.equal(closedRestoreId, "restore-1");
+    assert.equal(nextState.order.includes("restore-1"), false);
+    assert.equal(nextState.tabsByRestoreId["restore-1"], undefined);
+    assert.equal(nextState.selectedRestoreId, "restore-2");
+  });
 });

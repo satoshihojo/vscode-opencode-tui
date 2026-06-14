@@ -33,7 +33,7 @@
     "vscode": "^1.118.0"
   },
   "extensionKind": [
-    "ui"
+    "workspace"
   ],
   "capabilities": {
     "virtualWorkspaces": {

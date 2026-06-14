@@ -1,4 +1,5 @@
 import {
+  closeOpenCodeSessionTab,
   selectOpenCodeSessionTab,
   type OpenCodeSessionTabState,
 } from "./session-tab-status-registry";
@@ -37,7 +38,7 @@ export function handleOpenCodeSessionPanelMessage(
       return selectOpenCodeSessionTab(state, message.restoreId);
     case "close":
       void Promise.resolve(actions.closeSession?.(message.restoreId)).then(undefined, () => undefined);
-      return state;
+      return closeOpenCodeSessionTab(state, message.restoreId);
     default:
       return state;
   }

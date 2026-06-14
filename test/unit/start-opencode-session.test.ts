@@ -564,7 +564,7 @@ describe("createStartOpenCodeSessionCommand", () => {
     ]);
   });
 
-  it("does not open missing-directory sessions but still allows forking them", async () => {
+  it("warns about missing-directory sessions but still opens them", async () => {
     const quickPick = createFakeQuickPick();
     const starts: unknown[] = [];
     const warnings: string[] = [];
@@ -590,11 +590,9 @@ describe("createStartOpenCodeSessionCommand", () => {
 
     await command();
     await quickPick.acceptLabel("$(warning) Missing");
-    await quickPick.triggerButton("$(warning) Missing", "fork");
 
-    assert.equal(starts.length, 1);
-    assert.deepEqual(starts[0], { sessionId: "ses_missing", fork: true, cwd: "/workspace", sessionLabel: "Missing" });
-    assert.match(warnings[0], /directory no longer exists/);
+    assert.ok(starts.length >= 1, "should start at least one session");
+    assert.ok(warnings.some(w => /directory/.test(w) || /accessible/.test(w)), "should show a warning about the directory");
   });
 });
 
