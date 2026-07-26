@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { OPENCODE_TERMINAL_VIEW_COLUMN } from "../layout/side-by-side-layout";
-import { resolveOpenCodeCommand } from "./command";
+import { parseWslUncPath, resolveOpenCodeCommand } from "./command";
 
 type SessionManagerOptions = {
   openCodeCommand?: string;
@@ -116,7 +116,13 @@ export class OpenCodeSessionManager {
     const bridgePort = readPortFromBridgeUrl(extraEnvironment.OPENCODE_VSCODE_BRIDGE_URL);
     const openCodePort = this.createOpenCodePort(bridgePort);
     env._EXTENSION_OPENCODE_PORT = String(openCodePort);
-    const command = `${resolveOpenCodeCommand(this.command)} --port ${openCodePort}${toSessionArgument(options)}`;
+    // When resuming a session whose cwd is a WSL UNC path (e.g. open of a
+    // session created inside WSL), spawn the terminal inside WSL itself via
+    // wsl.exe. Use the bare "opencode" shim rather than the Windows opencode.cmd
+    // wrapper — the WSL bash shell resolves opencode from ~/.bashrc's PATH.
+    const wslBridge = options.cwd ? parseWslUncPath(options.cwd) : undefined;
+    const openCodeToken = wslBridge ? this.command.trim() || "opencode" : resolveOpenCodeCommand(this.command);
+    const command = `${openCodeToken} --port ${openCodePort}${toSessionArgument(options)}`;
     const terminalName = options.sessionLabel?.trim()
       ? buildOpenCodeTerminalName(options)
       : options.terminalName ?? buildOpenCodeTerminalName(options);
@@ -125,9 +131,9 @@ export class OpenCodeSessionManager {
       command,
       env,
       strictEnv: true,
-      cwd: options.cwd,
-      shellPath: terminalShellOverride?.shellPath,
-      shellArgs: terminalShellOverride?.shellArgs,
+      cwd: wslBridge ? undefined : options.cwd,
+      shellPath: wslBridge ? "wsl.exe" : terminalShellOverride?.shellPath,
+      shellArgs: wslBridge ? ["-d", wslBridge.distro, "--cd", wslBridge.path] : terminalShellOverride?.shellArgs,
       terminalName,
       openCodePort,
       location: {

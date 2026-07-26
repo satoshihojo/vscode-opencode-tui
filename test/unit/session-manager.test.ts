@@ -8,7 +8,7 @@ import {
   OpenCodeSessionManager,
   readWindowsEditorExecutable,
 } from "../../src/opencode/session-manager";
-import { resolveOpenCodeCommand, resolveOpenCodeSpawnCommand } from "../../src/opencode/command";
+import { resolveOpenCodeCommand, resolveOpenCodeSpawnCommand, resolveWslBridgedSpawn, isWslBridgeRequired, parseWslUncPath } from "../../src/opencode/command";
 
 describe("buildSessionConfigContent", () => {
   it("builds a deterministic session config without mutating the base config", () => {
@@ -90,6 +90,102 @@ describe("resolveOpenCodeCommand", () => {
     assert.deepEqual(resolveOpenCodeSpawnCommand("C:\\Program Files\\OpenCode\\opencode.exe", ["db", "path"], "win32"), {
       command: "C:\\Program Files\\OpenCode\\opencode.exe",
       args: ["db", "path"],
+    });
+  });
+
+  describe("resolveWslBridgedSpawn", () => {
+    it("returns undefined on linux regardless of cwd", () => {
+      assert.equal(
+        resolveWslBridgedSpawn("opencode", ["db", "path"], "\\\\wsl.localhost\\Ubuntu\\home\\me", "linux"),
+        undefined,
+      );
+    });
+
+    it("returns undefined when cwd is undefined", () => {
+      assert.equal(resolveWslBridgedSpawn("opencode", ["db", "path"], undefined, "win32"), undefined);
+    });
+
+    it("returns undefined when cwd is not a WSL UNC path", () => {
+      assert.equal(resolveWslBridgedSpawn("opencode", ["db", "path"], "C:\\Users\\me", "win32"), undefined);
+    });
+
+    it("returns undefined when command is not the bare opencode shim", () => {
+      assert.equal(
+        resolveWslBridgedSpawn("C:\\Program Files\\opencode.exe", ["db", "path"], "\\\\wsl.localhost\\Ubuntu\\home\\me", "win32"),
+        undefined,
+      );
+    });
+
+    it("bridges a wsl.localhost UNC path through wsl.exe", () => {
+      assert.deepEqual(
+        resolveWslBridgedSpawn("opencode", ["db", "path"], "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj", "win32"),
+        {
+          command: "wsl.exe",
+          args: ["-d", "Ubuntu", "--cd", "/home/me/proj", "-e", "bash", "-ic", "opencode 'db' 'path'"],
+          cwd: undefined,
+        },
+      );
+    });
+
+    it("bridges a legacy wsl$ UNC path through wsl.exe", () => {
+      assert.deepEqual(
+        resolveWslBridgedSpawn("opencode", ["db", "path"], "\\\\wsl$\\Debian\\root\\proj", "win32"),
+        {
+          command: "wsl.exe",
+          args: ["-d", "Debian", "--cd", "/root/proj", "-e", "bash", "-ic", "opencode 'db' 'path'"],
+          cwd: undefined,
+        },
+      );
+    });
+
+    it("shell-quotes opencode args containing single quotes (SQL literals)", () => {
+      assert.deepEqual(
+        resolveWslBridgedSpawn("opencode", ["db", "select * from session where id = 'ses_1'", "--format", "json"], "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj", "win32"),
+        {
+          command: "wsl.exe",
+          args: ["-d", "Ubuntu", "--cd", "/home/me/proj", "-e", "bash", "-ic", "opencode 'db' 'select * from session where id = '\\''ses_1'\\''' '--format' 'json'"],
+          cwd: undefined,
+        },
+      );
+    });
+  });
+
+  describe("isWslBridgeRequired", () => {
+    it("returns true for a win32 WSL UNC cwd", () => {
+      assert.equal(isWslBridgeRequired("\\\\wsl.localhost\\Ubuntu\\home\\me", "win32"), true);
+    });
+
+    it("returns false for a non-UNC win32 cwd", () => {
+      assert.equal(isWslBridgeRequired("C:\\Users\\me", "win32"), false);
+    });
+
+    it("returns false for an undefined cwd", () => {
+      assert.equal(isWslBridgeRequired(undefined, "win32"), false);
+    });
+
+    it("returns false on linux", () => {
+      assert.equal(isWslBridgeRequired("\\\\wsl.localhost\\Ubuntu\\home\\me", "linux"), false);
+    });
+  });
+
+  describe("parseWslUncPath", () => {
+    it("parses a wsl.localhost path with a deep tail", () => {
+      assert.deepEqual(parseWslUncPath("\\\\wsl.localhost\\Ubuntu\\home\\me\\proj"), {
+        distro: "Ubuntu",
+        path: "/home/me/proj",
+      });
+    });
+
+    it("parses a legacy wsl$ path", () => {
+      assert.deepEqual(parseWslUncPath("\\\\wsl$\\Debian\\root"), { distro: "Debian", path: "/root" });
+    });
+
+    it("returns undefined for a plain drive path", () => {
+      assert.equal(parseWslUncPath("C:\\Users\\me"), undefined);
+    });
+
+    it("returns undefined for a non-UNC path", () => {
+      assert.equal(parseWslUncPath("/home/me"), undefined);
     });
   });
 });
@@ -287,6 +383,41 @@ describe("OpenCodeSessionManager", () => {
     assert.equal(launch.cwd, "/workspace-a");
     assert.equal(capturedCwd, "/workspace-a");
     assert.equal(capturedName, "Long Session Title");
+  });
+
+  it("launches opencode inside wsl.exe when the session cwd is a WSL UNC path", () => {
+    let capturedShellPath: string | undefined;
+    let capturedShellArgs: string[] | undefined;
+    let capturedCwd: string | undefined;
+    const sessionManager = new OpenCodeSessionManager(
+      ({ cwd, shellPath, shellArgs }) => {
+        capturedCwd = cwd;
+        capturedShellPath = shellPath;
+        capturedShellArgs = shellArgs;
+        return { show() {}, sendText() {} };
+      },
+      () => "{\"plugin\":[]}",
+      () => ({}),
+      { openCodePortFactory: () => 9020 },
+    );
+
+    const cwd = "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj";
+    const launch = sessionManager.buildLaunchSpec(
+      { PATH: "/usr/bin" },
+      { sessionId: "ses_abcdef123456", cwd, sessionLabel: "WSL session" },
+    );
+    sessionManager.startSession(
+      { PATH: "/usr/bin" },
+      { sessionId: "ses_abcdef123456", cwd, sessionLabel: "WSL session" },
+    );
+
+    assert.equal(launch.command, "opencode --port 9020 -s ses_abcdef123456");
+    assert.equal(launch.cwd, undefined);
+    assert.equal(launch.shellPath, "wsl.exe");
+    assert.deepEqual(launch.shellArgs, ["-d", "Ubuntu", "--cd", "/home/me/proj"]);
+    assert.equal(capturedCwd, undefined);
+    assert.equal(capturedShellPath, "wsl.exe");
+    assert.deepEqual(capturedShellArgs, ["-d", "Ubuntu", "--cd", "/home/me/proj"]);
   });
 
   it("uses explicit editor environment for terminal-launched editor commands", () => {

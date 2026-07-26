@@ -2,7 +2,7 @@
   "name": "opencode-tui-integration",
   "displayName": "OpenCode TUI Integration",
   "description": "Start OpenCode from VS Code and review agent edits with a persistent Keep/Undo queue",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "satoshihojo",
   "preview": true,
   "license": "MIT",

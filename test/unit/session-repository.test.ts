@@ -360,6 +360,38 @@ describe("OpenCodeSessionRepository", () => {
     }
   });
 
+  it("bridges WSL UNC workspaces through wsl.exe and skips bundled sqlite for async session reads", async () => {
+    const calls: Array<{ command: string; args: string[]; cwd?: string }> = [];
+    let openedDatabase = false;
+    const repository = new OpenCodeSessionRepository({
+      platform: "win32",
+      runAsync: async (command, args, options) => {
+        calls.push({ command, args, cwd: options?.cwd });
+        return {
+          status: 0,
+          stdout: JSON.stringify([{ id: "ses_wsl", title: "WSL", directory: "/home/me/proj", time_updated: 30 }]),
+          stderr: "",
+        };
+      },
+      openDatabase: (() => {
+        openedDatabase = true;
+        throw new Error("bundled sqlite should not be opened for a WSL-bridged workspace");
+      }) as never,
+    });
+
+    const cwd = "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj";
+    const session = await repository.findSessionByIdAsync("ses_wsl", cwd);
+
+    assert.equal(openedDatabase, false);
+    assert.deepEqual(session, { id: "ses_wsl", title: "WSL", directory: "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj", updated: 30 });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], {
+      command: "wsl.exe",
+      args: ["-d", "Ubuntu", "--cd", "/home/me/proj", "-e", "bash", "-ic", "opencode 'db' 'select id, project_id, parent_id, title, directory, time_created, time_updated, time_archived from session where id = '\\''ses_wsl'\\'' limit 1' '--format' 'json'"],
+      cwd: undefined,
+    });
+  });
+
   it("deletes a parent session and its descendants through a single bundled sqlite write", async () => {
     const calls: string[][] = [];
     const writes: RecordedWrite[] = [];

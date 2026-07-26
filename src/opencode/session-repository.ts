@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { resolveOpenCodeSpawnCommand } from "./command";
+import { buildWslUncPath, isWslBridgeRequired, parseWslUncPath, resolveOpenCodeSpawnCommand, resolveWslBridgedSpawn } from "./command";
 import { isValidSessionId } from "./session-manager";
 
 export type OpenCodeSessionSummary = {
@@ -47,6 +47,7 @@ type RepositoryOptions = {
   now?: () => number;
   openDatabase?: SqliteDatabaseConstructor;
   busyTimeoutMs?: number;
+  platform?: NodeJS.Platform;
 };
 
 type SessionOverride = {
@@ -62,6 +63,7 @@ export class OpenCodeSessionRepository {
   private readonly now: () => number;
   private readonly openDatabase?: SqliteDatabaseConstructor;
   private readonly busyTimeoutMs: number;
+  private readonly platform: NodeJS.Platform;
   private readonly databasePaths = new Map<string, string>();
   private readonly sessionOverrides = new Map<string, SessionOverride>();
 
@@ -73,6 +75,7 @@ export class OpenCodeSessionRepository {
     this.now = options.now ?? Date.now;
     this.openDatabase = options.openDatabase;
     this.busyTimeoutMs = resolveBusyTimeoutMs(options.busyTimeoutMs);
+    this.platform = options.platform ?? process.platform;
   }
 
   listSessions(cwd?: string): OpenCodeSessionSummary[] {
@@ -269,8 +272,8 @@ export class OpenCodeSessionRepository {
   }
 
   private querySessionsCli(query: string, cwd?: string) {
-    const command = this.createSpawnCommand(["db", query, "--format", "json"]);
-    const result = this.run(command.command, command.args, { cwd, encoding: "utf8", timeout: 5000 });
+    const command = this.createSpawnCommand(["db", query, "--format", "json"], cwd);
+    const result = this.run(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
 
     if (result.status !== 0) {
       throw new Error(`Failed to list OpenCode sessions: ${formatFailure(result)}`);
@@ -281,12 +284,12 @@ export class OpenCodeSessionRepository {
       throw new Error("Failed to list OpenCode sessions: expected a JSON array.");
     }
 
-    return parsed.flatMap(parseSessionRecord);
+    return this.rewriteSessionDirectories(parsed.flatMap(parseSessionRecord), cwd);
   }
 
   private async querySessionsAsyncCli(query: string, cwd?: string) {
-    const command = this.createSpawnCommand(["db", query, "--format", "json"]);
-    const result = await this.runAsync(command.command, command.args, { cwd, encoding: "utf8", timeout: 5000 });
+    const command = this.createSpawnCommand(["db", query, "--format", "json"], cwd);
+    const result = await this.runAsync(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
 
     if (result.status !== 0) {
       throw new Error(`Failed to list OpenCode sessions: ${formatFailure(result)}`);
@@ -297,10 +300,38 @@ export class OpenCodeSessionRepository {
       throw new Error("Failed to list OpenCode sessions: expected a JSON array.");
     }
 
-    return parsed.flatMap(parseSessionRecord);
+    return this.rewriteSessionDirectories(parsed.flatMap(parseSessionRecord), cwd);
+  }
+
+  // When sessions come back via the WSL bridge, their `directory` is a Linux
+  // path (e.g. /home/me/proj) that the Windows-side host cannot stat or use as a
+  // terminal cwd. Re-anchor it under the WSL distro's UNC root so downstream
+  // path-existence checks and the terminal launcher can consume it as a normal
+  // Windows UNC path.
+  private rewriteSessionDirectories(sessions: OpenCodeSessionSummary[], cwd: string | undefined): OpenCodeSessionSummary[] {
+    if (!cwd || !isWslBridgeRequired(cwd, this.platform)) {
+      return sessions;
+    }
+    const wsl = parseWslUncPath(cwd);
+    if (!wsl) {
+      return sessions;
+    }
+    return sessions.map((session) => {
+      if (typeof session.directory !== "string" || !session.directory.startsWith("/")) {
+        return session;
+      }
+      return { ...session, directory: buildWslUncPath(wsl.distro, session.directory) };
+    });
   }
 
   private async querySessionsSqlite(query: string, params: unknown[], cwd: string | undefined, action: "find" | "list") {
+    // WSL workspaces are bridged through wsl.exe, so "opencode db path" returns a
+    // Linux database path that the Windows-side node:sqlite cannot open. Skip
+    // the bundled sqlite read and go straight to the async CLI, which also runs
+    // through wsl.exe.
+    if (isWslBridgeRequired(cwd, this.platform)) {
+      return this.querySessionsAsyncCli(bindSqlForCli(query, params), cwd);
+    }
     try {
       return await this.querySessionsSqliteRequired(query, params, cwd, action);
     } catch (error) {
@@ -376,8 +407,8 @@ export class OpenCodeSessionRepository {
       return cachedPath;
     }
 
-    const command = this.createSpawnCommand(["db", "path"]);
-    const pathResult = this.run(command.command, command.args, { cwd, encoding: "utf8", timeout: 5000 });
+    const command = this.createSpawnCommand(["db", "path"], cwd);
+    const pathResult = this.run(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
     if (pathResult.status !== 0) {
       throw new Error(`Failed to ${action} OpenCode session: ${formatFailure(pathResult)}`);
     }
@@ -398,8 +429,8 @@ export class OpenCodeSessionRepository {
       return cachedPath;
     }
 
-    const command = this.createSpawnCommand(["db", "path"]);
-    const pathResult = await this.runAsync(command.command, command.args, { cwd, encoding: "utf8", timeout: 5000 });
+    const command = this.createSpawnCommand(["db", "path"], cwd);
+    const pathResult = await this.runAsync(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
     if (pathResult.status !== 0) {
       throw new Error(`Failed to ${action} OpenCode session: ${formatFailure(pathResult)}`);
     }
@@ -422,8 +453,13 @@ export class OpenCodeSessionRepository {
     return override.session;
   }
 
-  private createSpawnCommand(args: readonly string[]) {
-    return resolveOpenCodeSpawnCommand(this.command, args);
+  private createSpawnCommand(args: readonly string[], cwd?: string): { command: string; args: string[]; cwd?: string } {
+    const wslBridge = resolveWslBridgedSpawn(this.command, args, cwd, this.platform);
+    if (wslBridge) {
+      return wslBridge;
+    }
+    const resolved = resolveOpenCodeSpawnCommand(this.command, args, this.platform);
+    return { command: resolved.command, args: resolved.args, cwd };
   }
 
   private readLatestSessionOverrideByTitle(title: string, cwd?: string) {
