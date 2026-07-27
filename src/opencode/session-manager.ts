@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { BRIDGE_PORT_ENV } from "../bridge-protocol";
 import { OPENCODE_TERMINAL_VIEW_COLUMN } from "../layout/side-by-side-layout";
 import { parseWslUncPath, resolveOpenCodeCommand } from "./command";
 
@@ -122,7 +123,21 @@ export class OpenCodeSessionManager {
     // wrapper — the WSL bash shell resolves opencode from ~/.bashrc's PATH.
     const wslBridge = options.cwd ? parseWslUncPath(options.cwd) : undefined;
     const openCodeToken = wslBridge ? this.command.trim() || "opencode" : resolveOpenCodeCommand(this.command);
-    const command = `${openCodeToken} --port ${openCodePort}${toSessionArgument(options)}`;
+    const rawCommand = `${openCodeToken} --port ${openCodePort}${toSessionArgument(options)}`;
+    // When bridging into WSL via wsl.exe, also rebind the bridge env so it
+    // survives the WSL boundary and can reach the Windows-side bridge server
+    // from inside the WSL bash. Without this, wsl.exe drops the bridge env
+    // vars (they aren't in WSLENV), the embedded plugin URL points at a
+    // Windows drive WSL can't import, and OPENCODE_VSCODE_BRIDGE_URL's
+    // 127.0.0.1 resolves to the WSL bash own loopback instead of the Windows
+    // host. buildWslBridgeCommand augments WSLENV, translates the plugin
+    // URL to a /mnt/<drive>/... form, drops the Windows-side URL, and
+    // prepends a bash preamble that auto-detects the WSL-reachable Windows
+    // host IP and rebuilds OPENCODE_VSCODE_BRIDGE_URL at runtime.
+    const wslBridgePort = wslBridge ? resolveBridgePortForWsl(env[BRIDGE_PORT_ENV]) : undefined;
+    const command = wslBridge && wslBridgePort
+      ? buildWslBridgeCommand(rawCommand, env, baseEnv, wslBridgePort)
+      : rawCommand;
     const terminalName = options.sessionLabel?.trim()
       ? buildOpenCodeTerminalName(options)
       : options.terminalName ?? buildOpenCodeTerminalName(options);
@@ -413,6 +428,142 @@ function readPortFromBridgeUrl(value: string | undefined) {
   } catch {
     return undefined;
   }
+}
+
+function resolveBridgePortForWsl(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 && parsed < 65536 ? parsed : undefined;
+}
+
+export function buildWslBridgeCommand(
+  rawCommand: string,
+  env: Record<string, string>,
+  baseEnv: NodeJS.ProcessEnv,
+  bridgePort: number,
+): string {
+  // OPENCODE_CONFIG_CONTENT embeds plugin URLs as Windows-side file:// URLs
+  // (e.g. file:///C:/Users/.../dist/vscode-bridge-plugin.mjs). WSL opencode
+  // cannot import those. WSLENV only translates per-var path values, not URLs
+  // inside a JSON string, so rewrite them here before they cross the WSL
+  // boundary into /mnt/<drive>/... form.
+  if (env.OPENCODE_CONFIG_CONTENT) {
+    env.OPENCODE_CONFIG_CONTENT = translateConfigContentPluginUrlsForWsl(env.OPENCODE_CONFIG_CONTENT);
+  }
+
+  // Drop the Windows-side 127.0.0.1 bridge URL. Inside WSL2, 127.0.0.1 refers
+  // to the WSL bash own loopback, not the Windows host where the bridge
+  // server actually listens (bound on 0.0.0.0). The bash preamble below
+  // reconstructs OPENCODE_VSCODE_BRIDGE_URL with the WSL-reachable Windows
+  // host IP at runtime.
+  if (env.OPENCODE_VSCODE_BRIDGE_URL) {
+    delete env.OPENCODE_VSCODE_BRIDGE_URL;
+  }
+
+  // wsl.exe only forwards env vars listed in WSLENV. Augment WSLENV with the
+  // bridge/session keys so the WSL bash sees them. Mark OPENCODE_TUI_CONFIG
+  // with /p so wsl.exe auto-translates the Windows-style absolute path to a
+  // /mnt/<drive>/... WSL path across the boundary.
+  const wslBridgeEnvKeys = collectWslBridgeEnvKeys(env);
+  const wslenvEntries = wslBridgeEnvKeys.map((key) =>
+    key === "OPENCODE_TUI_CONFIG" ? `${key}/p` : key,
+  );
+  env.WSLENV = augmentWslenvForWslBridge(baseEnv.WSLENV, wslenvEntries);
+
+  return [
+    // Auto-detect the Windows host IP from the WSL2 NAT default-route next hop;
+    // fall back to the /etc/resolv.conf nameserver (traditional WSL2 NAT), then
+    // 127.0.0.1 (Windows 11 mirrored networking shares loopback between WSL
+    // and the Windows host).
+    "WIN_HOST_IP=$(ip route show default 2>/dev/null | awk '{print $3; exit}');",
+    "if [ -z \"$WIN_HOST_IP\" ]; then",
+    "WIN_HOST_IP=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null);",
+    "fi;",
+    "if [ -z \"$WIN_HOST_IP\" ]; then",
+    "WIN_HOST_IP=127.0.0.1;",
+    "fi;",
+    `export OPENCODE_VSCODE_BRIDGE_URL="http://\${WIN_HOST_IP}:${bridgePort}/bridge";`,
+    rawCommand,
+  ].join(" ");
+}
+
+function collectWslBridgeEnvKeys(env: Record<string, string>): string[] {
+  return Object.keys(env).filter((key) =>
+    key.startsWith("OPENCODE_")
+    || key === "_EXTENSION_OPENCODE_PORT"
+    || key === "EDITOR"
+    || key === "VISUAL",
+  );
+}
+
+export function augmentWslenvForWslBridge(existingWslenv: string | undefined, keys: string[]): string {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  const existingList = (existingWslenv ?? "")
+    .split(/:/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  for (const entry of existingList) {
+    if (!seen.has(entry)) {
+      seen.add(entry);
+      merged.push(entry);
+    }
+  }
+  for (const entry of keys) {
+    if (!seen.has(entry)) {
+      seen.add(entry);
+      merged.push(entry);
+    }
+  }
+  return merged.join(":");
+}
+
+export function translateConfigContentPluginUrlsForWsl(configContent: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(configContent);
+  } catch {
+    return configContent;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return configContent;
+  }
+  const record = parsed as Record<string, unknown>;
+  const pluginField = record.plugin;
+  if (!Array.isArray(pluginField)) {
+    return configContent;
+  }
+  let mutated = false;
+  const translated = pluginField.map((entry) => {
+    if (typeof entry !== "string") {
+      return entry;
+    }
+    const next = translateWindowsFileUrlToWsl(entry);
+    if (next !== entry) {
+      mutated = true;
+    }
+    return next;
+  });
+  if (!mutated) {
+    return configContent;
+  }
+  record.plugin = translated;
+  return JSON.stringify(record);
+}
+
+export function translateWindowsFileUrlToWsl(url: string): string {
+  // Match file:///<drive>:(/|\)<rest> as emitted by vscode.Uri.file on
+  // Windows (the colon may also be %-encoded as %3A). Translate to
+  // file:///mnt/<lower-drive>/<rest> with forward slashes.
+  const match = url.match(/^file:\/\/\/([A-Za-z])(?::|%3A)([\\\/])(.*)$/i);
+  if (!match) {
+    return url;
+  }
+  const drive = match[1].toLowerCase();
+  const rest = match[3].replace(/\\/g, "/");
+  return `file:///mnt/${drive}/${rest}`;
 }
 
 function createRandomOpenCodePort() {

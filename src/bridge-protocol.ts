@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const BRIDGE_TOKEN_HEADER = "x-opencode-vscode-bridge-token";
 export const BRIDGE_URL_ENV = "OPENCODE_VSCODE_BRIDGE_URL";
+export const BRIDGE_PORT_ENV = "OPENCODE_VSCODE_BRIDGE_PORT";
 export const BRIDGE_TOKEN_ENV = "OPENCODE_VSCODE_BRIDGE_TOKEN";
 export const WORKSPACE_ROOTS_ENV = "OPENCODE_VSCODE_WORKSPACE_ROOTS";
 

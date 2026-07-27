@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  augmentWslenvForWslBridge,
   buildOpenCodeRelaunchCommand,
   buildOpenCodeTerminalName,
   buildSessionConfigContent,
   createSessionEnvironment,
   OpenCodeSessionManager,
   readWindowsEditorExecutable,
+  translateConfigContentPluginUrlsForWsl,
+  translateWindowsFileUrlToWsl,
 } from "../../src/opencode/session-manager";
 import { resolveOpenCodeCommand, resolveOpenCodeSpawnCommand, resolveWslBridgedSpawn, isWslBridgeRequired, parseWslUncPath } from "../../src/opencode/command";
 
@@ -693,5 +696,193 @@ describe("OpenCodeSessionManager", () => {
       command,
       'set "OPENCODE_CONFIG_CONTENT=100%% ""quoted""" && opencode --port 9003',
     );
+  });
+});
+
+describe("translateWindowsFileUrlToWsl", () => {
+  it("translates a Windows file:///DRIVE:/ URL to /mnt/<drive>/...", () => {
+    assert.equal(
+      translateWindowsFileUrlToWsl("file:///C:/Users/me/foo.mjs"),
+      "file:///mnt/c/Users/me/foo.mjs",
+    );
+  });
+
+  it("translates a %-encoded Windows file:///DRIVE%3A URL", () => {
+    assert.equal(
+      translateWindowsFileUrlToWsl("file:///C%3A/Users/me/foo.mjs"),
+      "file:///mnt/c/Users/me/foo.mjs",
+    );
+  });
+
+  it("normalizes backslashes to forward slashes", () => {
+    assert.equal(
+      translateWindowsFileUrlToWsl("file:///D:\\Users\\me\\foo.mjs"),
+      "file:///mnt/d/Users/me/foo.mjs",
+    );
+  });
+
+  it("lower-cases the drive letter", () => {
+    assert.equal(
+      translateWindowsFileUrlToWsl("file:///D:/FP/Foo.mjs"),
+      "file:///mnt/d/FP/Foo.mjs",
+    );
+  });
+
+  it("leaves non-file:/// URLs unchanged", () => {
+    assert.equal(
+      translateWindowsFileUrlToWsl("http://127.0.0.1:1234/bridge"),
+      "http://127.0.0.1:1234/bridge",
+    );
+  });
+
+  it("leaves already-translated /mnt/<drive>/ URLs unchanged", () => {
+    assert.equal(
+      translateWindowsFileUrlToWsl("file:///mnt/c/Users/me/foo.mjs"),
+      "file:///mnt/c/Users/me/foo.mjs",
+    );
+  });
+});
+
+describe("translateConfigContentPluginUrlsForWsl", () => {
+  it("translates plugin URLs inside OPENCODE_CONFIG_CONTENT", () => {
+    const input = JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      plugin: [
+        "file:///C:/Users/me/.vscode/extensions/satoshihojo.opencode-tui-integration-0.1.1/dist/vscode-bridge-plugin.mjs",
+      ],
+    });
+    const output = translateConfigContentPluginUrlsForWsl(input);
+    const parsed = JSON.parse(output) as { plugin: string[] };
+    assert.equal(
+      parsed.plugin[0],
+      "file:///mnt/c/Users/me/.vscode/extensions/satoshihojo.opencode-tui-integration-0.1.1/dist/vscode-bridge-plugin.mjs",
+    );
+  });
+
+  it("returns the input unchanged when no file:// URLs need translation", () => {
+    const input = JSON.stringify({
+      plugin: ["file:///mnt/c/Users/me/foo.mjs"],
+    });
+    assert.equal(translateConfigContentPluginUrlsForWsl(input), input);
+  });
+
+  it("returns the input unchanged when JSON parsing fails", () => {
+    assert.equal(translateConfigContentPluginUrlsForWsl("not json"), "not json");
+  });
+
+  it("preserves other config fields when translating plugin URLs", () => {
+    const input = JSON.stringify({
+      permission: { edit: "deny" } as Record<string, unknown>,
+      plugin: ["file:///C:/foo.mjs"],
+    });
+    const output = translateConfigContentPluginUrlsForWsl(input);
+    const parsed = JSON.parse(output) as {
+      permission: Record<string, unknown>;
+      plugin: string[];
+    };
+    assert.deepEqual(parsed.permission, { edit: "deny" });
+    assert.equal(parsed.plugin[0], "file:///mnt/c/foo.mjs");
+  });
+});
+
+describe("augmentWslenvForWslBridge", () => {
+  it("joins keys with colons when WSLENV is undefined", () => {
+    assert.equal(
+      augmentWslenvForWslBridge(undefined, ["FOO", "BAR"]),
+      "FOO:BAR",
+    );
+  });
+
+  it("preserves user-provided WSLENV entries and appends new keys", () => {
+    assert.equal(
+      augmentWslenvForWslBridge("EXISTING/p:OTHER", ["FOO", "BAR"]),
+      "EXISTING/p:OTHER:FOO:BAR",
+    );
+  });
+
+  it("deduplicates keys already present in user-provided WSLENV", () => {
+    assert.equal(
+      augmentWslenvForWslBridge("FOO:EXISTING", ["FOO", "BAR"]),
+      "FOO:EXISTING:BAR",
+    );
+  });
+});
+
+describe("OpenCodeSessionManager WSL bridge env translation", () => {
+  it("translates plugin URLs, removes the 127.0.0.1 bridge URL, augments WSLENV, and prepends a WIN_HOST_IP preamble when bridge server env is present", () => {
+    const sessionManager = new OpenCodeSessionManager(
+      () => ({ show() {}, sendText() {} }),
+      () => JSON.stringify({
+        $schema: "https://opencode.ai/config.json",
+        plugin: [
+          "file:///C:/Users/me/.vscode/extensions/satoshihojo.opencode-tui-integration-0.1.1/dist/vscode-bridge-plugin.mjs",
+        ],
+      }),
+      () => ({
+        OPENCODE_VSCODE_BRIDGE_URL: "http://127.0.0.1:9000/bridge",
+        OPENCODE_VSCODE_BRIDGE_PORT: "9000",
+        OPENCODE_VSCODE_BRIDGE_TOKEN: "secret",
+        OPENCODE_VSCODE_WORKSPACE_ROOTS: JSON.stringify(["\\\\wsl.localhost\\Ubuntu\\home\\me\\proj"]),
+        OPENCODE_TUI_CONFIG: "C:\\Users\\me\\.vscode\\extensions\\satoshihojo.opencode-tui-integration-0.1.1\\dist\\vscode-tui-config.json",
+      }),
+      { openCodePortFactory: () => 9001 },
+    );
+
+    const cwd = "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj";
+    const launch = sessionManager.buildLaunchSpec(
+      { PATH: "/usr/bin" },
+      { sessionId: "ses_abcdef123456", cwd, sessionLabel: "WSL session" },
+    );
+
+    assert.equal(launch.env.OPENCODE_VSCODE_BRIDGE_URL, undefined);
+    assert.equal(launch.env.OPENCODE_VSCODE_BRIDGE_PORT, "9000");
+    assert.equal(launch.env.OPENCODE_VSCODE_BRIDGE_TOKEN, "secret");
+
+    const configContent = JSON.parse(launch.env.OPENCODE_CONFIG_CONTENT) as { plugin: string[] };
+    assert.equal(
+      configContent.plugin[0],
+      "file:///mnt/c/Users/me/.vscode/extensions/satoshihojo.opencode-tui-integration-0.1.1/dist/vscode-bridge-plugin.mjs",
+    );
+
+    assert.ok(launch.env.WSLENV, "WSLENV should be set");
+    for (const key of [
+      "OPENCODE_CONFIG_CONTENT",
+      "OPENCODE_CALLER",
+      "OPENCODE_VSCODE_BRIDGE_PORT",
+      "OPENCODE_VSCODE_BRIDGE_TOKEN",
+      "OPENCODE_VSCODE_WORKSPACE_ROOTS",
+      "OPENCODE_TUI_CONFIG/p",
+      "_EXTENSION_OPENCODE_PORT",
+    ]) {
+      assert.ok(
+        launch.env.WSLENV.includes(key),
+        `WSLENV should include ${key} (actual: ${launch.env.WSLENV})`,
+      );
+    }
+
+    assert.equal(launch.shellPath, "wsl.exe");
+    assert.deepEqual(launch.shellArgs, ["-d", "Ubuntu", "--cd", "/home/me/proj"]);
+
+    const expectedPreamble = `WIN_HOST_IP=$(ip route show default 2>/dev/null | awk '{print $3; exit}'); if [ -z "$WIN_HOST_IP" ]; then WIN_HOST_IP=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null); fi; if [ -z "$WIN_HOST_IP" ]; then WIN_HOST_IP=127.0.0.1; fi; export OPENCODE_VSCODE_BRIDGE_URL="http://\${WIN_HOST_IP}:9000/bridge"; opencode --port 9001 -s ses_abcdef123456`;
+    assert.equal(launch.command, expectedPreamble);
+  });
+
+  it("keeps the bare opencode command when no bridge port is supplied to a WSL UNC workspace", () => {
+    const sessionManager = new OpenCodeSessionManager(
+      () => ({ show() {}, sendText() {} }),
+      () => "{\"plugin\":[]}",
+      () => ({}),
+      { openCodePortFactory: () => 9020 },
+    );
+
+    const cwd = "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj";
+    const launch = sessionManager.buildLaunchSpec(
+      { PATH: "/usr/bin" },
+      { sessionId: "ses_abcdef123456", cwd, sessionLabel: "WSL session" },
+    );
+
+    assert.equal(launch.command, "opencode --port 9020 -s ses_abcdef123456");
+    assert.equal(launch.env.OPENCODE_VSCODE_BRIDGE_URL, undefined);
+    assert.equal(launch.env.WSLENV, undefined);
   });
 });

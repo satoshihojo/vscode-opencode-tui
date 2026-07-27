@@ -3,7 +3,7 @@ import * as http from "node:http";
 import * as vscode from "vscode";
 import { ZodError } from "zod";
 import { createApplyPatchFailureRecord, type ApplyPatchFailureRecord } from "./apply-patch-failure-log";
-import { BRIDGE_TOKEN_ENV, BRIDGE_TOKEN_HEADER, BRIDGE_URL_ENV, WORKSPACE_ROOTS_ENV, BridgeMessageSchema, type BridgeMessage, type BridgeResponse, type TuiSessionActiveMessage } from "./bridge-protocol";
+import { BRIDGE_PORT_ENV, BRIDGE_TOKEN_ENV, BRIDGE_TOKEN_HEADER, BRIDGE_URL_ENV, WORKSPACE_ROOTS_ENV, BridgeMessageSchema, type BridgeMessage, type BridgeResponse, type TuiSessionActiveMessage } from "./bridge-protocol";
 import { prepareOperation, type FileState, type PreparedOperation } from "./bridge-editing";
 import { BRIDGE_PLUGIN_FILENAME, TUI_CONFIG_FILENAME } from "./plugin-constants";
 
@@ -46,7 +46,11 @@ export class BridgeServer implements vscode.Disposable {
         this.port = address.port;
         resolve();
       });
-      this.server.listen(0, "127.0.0.1");
+      // Bind on 0.0.0.0 instead of 127.0.0.1 so that WSL2-side opencode can
+      // reach the bridge server through the Windows host's NAT-facing adapter
+      // IP. The token header still gates every /bridge POST, so the surface
+      // stays unchanged; only the listening interface widens.
+      this.server.listen(0, "0.0.0.0");
     });
   }
 
@@ -74,6 +78,7 @@ export class BridgeServer implements vscode.Disposable {
 
     return {
       [BRIDGE_URL_ENV]: `http://127.0.0.1:${this.port}/bridge`,
+      [BRIDGE_PORT_ENV]: String(this.port),
       [BRIDGE_TOKEN_ENV]: this.token,
       [WORKSPACE_ROOTS_ENV]: JSON.stringify((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)),
       OPENCODE_TUI_CONFIG: this.deps.asAbsolutePath(TUI_CONFIG_FILENAME),

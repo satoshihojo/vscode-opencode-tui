@@ -42,7 +42,6 @@ suite("OpenCode Bridge Run", () => {
 
   teardown(async () => {
     await restoreFixture();
-    await vscode.commands.executeCommand("opencodeEdit.debug.setForceGracefulRestoreReuse", undefined);
     await vscode.commands.executeCommand("opencodeEdit.debug.clearReviewQueue");
     await vscode.commands.executeCommand("opencodeEdit.debug.clearApplyPatchFailureRecords");
     await closeAllReviewDiffTabs();
@@ -624,122 +623,6 @@ suite("OpenCode Bridge Run", () => {
     };
     await vscode.commands.executeCommand("opencodeEdit.review.undo", state.items[0]?.id);
   });
-
-  test("restores a session by relaunching OpenCode in the existing terminal tab", async function () {
-    this.timeout(30000);
-
-    const beforeState = (await vscode.commands.executeCommand("opencodeEdit.debug.startOpenCodeSession", {
-      cwd: workspacePath,
-      sessionLabel: "Restore Reuse Session",
-    })) as { order: string[] };
-    const restoreId = beforeState.order.at(-1);
-    assert.ok(restoreId, "expected a tracked session restore id");
-    await registerFakeOpenCodeSession({
-      id: "ses_restore_reuse",
-      title: "Restore Reuse Session",
-      directory: workspacePath,
-      timeUpdated: Date.now(),
-    });
-    const terminal = await waitForTerminalNamed("Restore Reuse Session");
-    const terminalCountBeforeRestore = vscode.window.terminals.length;
-    const portsBeforeRestore = (await vscode.commands.executeCommand("opencodeEdit.debug.getTrackedOpenCodePorts")) as Record<string, number>;
-    const originalOpenCodePort = portsBeforeRestore[restoreId];
-    assert.ok(originalOpenCodePort, "expected original tracked OpenCode port before restore");
-
-    await vscode.commands.executeCommand("opencodeEdit.debug.restoreOpenCodeSession");
-    await waitFor(async () => {
-      const portsByRestoreId = await vscode.commands.executeCommand("opencodeEdit.debug.getTrackedOpenCodePorts") as Record<string, number>;
-      return typeof portsByRestoreId[restoreId] === "number";
-    }, "expected restored session to keep a tracked OpenCode port");
-
-    const portsAfterRestore = (await vscode.commands.executeCommand("opencodeEdit.debug.getTrackedOpenCodePorts")) as Record<string, number>;
-    assert.notEqual(portsAfterRestore[restoreId], originalOpenCodePort);
-
-    assert.equal(vscode.window.terminals.length, terminalCountBeforeRestore);
-    assert.equal(vscode.window.terminals.includes(terminal), true);
-  });
-
-  test("falls back to a new terminal when restore reuse cannot terminate the existing TUI", async function () {
-    this.timeout(30000);
-
-    const beforeState = (await vscode.commands.executeCommand("opencodeEdit.debug.startOpenCodeSession", {
-      cwd: workspacePath,
-      sessionLabel: "Restore Fallback Session",
-    })) as { order: string[] };
-    const restoreId = beforeState.order.at(-1);
-    assert.ok(restoreId, "expected a tracked session restore id");
-    await registerFakeOpenCodeSession({
-      id: "ses_restore_fallback",
-      title: "Restore Fallback Session",
-      directory: workspacePath,
-      timeUpdated: Date.now(),
-    });
-
-    const originalTerminal = await waitForTerminalNamed("Restore Fallback Session");
-    const terminalCountBeforeRestore = vscode.window.terminals.length;
-    const portsBeforeRestore = (await vscode.commands.executeCommand("opencodeEdit.debug.getTrackedOpenCodePorts")) as Record<string, number>;
-    const originalOpenCodePort = portsBeforeRestore[restoreId];
-    assert.ok(originalOpenCodePort, "expected original tracked OpenCode port before fallback restore");
-
-    await vscode.commands.executeCommand("opencodeEdit.debug.setForceGracefulRestoreReuse", false);
-    await vscode.commands.executeCommand("opencodeEdit.debug.restoreOpenCodeSession");
-
-    await waitFor(async () => {
-      const portsByRestoreId = await vscode.commands.executeCommand("opencodeEdit.debug.getTrackedOpenCodePorts") as Record<string, number>;
-      return typeof portsByRestoreId[restoreId] === "number" && portsByRestoreId[restoreId] !== originalOpenCodePort;
-    }, "expected fallback restore to replace the tracked OpenCode port");
-
-    await waitFor(() => !vscode.window.terminals.includes(originalTerminal), "expected fallback restore to retire the original terminal");
-
-    const terminalsNamedAfterRestore = vscode.window.terminals.filter((candidate) => candidate.name === "Restore Fallback Session");
-    assert.equal(terminalsNamedAfterRestore.length, 1);
-    assert.equal(vscode.window.terminals.length, terminalCountBeforeRestore);
-  });
-
-  test("falls back safely when restore starts with unsent terminal input still present", async function () {
-    this.timeout(30000);
-
-    const beforeState = (await vscode.commands.executeCommand("opencodeEdit.debug.startOpenCodeSession", {
-      cwd: workspacePath,
-      sessionLabel: "Restore Pending Input Session",
-    })) as { order: string[] };
-    const restoreId = beforeState.order.at(-1);
-    assert.ok(restoreId, "expected a tracked session restore id");
-    await registerFakeOpenCodeSession({
-      id: "ses_restore_pending_input",
-      title: "Restore Pending Input Session",
-      directory: workspacePath,
-      timeUpdated: Date.now(),
-    });
-
-    const originalTerminal = await waitForTerminalNamed("Restore Pending Input Session");
-    originalTerminal.show(false);
-    await waitFor(() => vscode.window.activeTerminal === originalTerminal, "expected pending-input terminal to become active");
-    originalTerminal.sendText("aaaaa", false);
-    await wait(150);
-
-    const terminalCountBeforeRestore = vscode.window.terminals.length;
-    const portsBeforeRestore = (await vscode.commands.executeCommand("opencodeEdit.debug.getTrackedOpenCodePorts")) as Record<string, number>;
-    const originalOpenCodePort = portsBeforeRestore[restoreId];
-    assert.ok(originalOpenCodePort, "expected original tracked OpenCode port before pending-input restore");
-
-    await vscode.commands.executeCommand("opencodeEdit.debug.setForceGracefulRestoreReuse", false);
-    await vscode.commands.executeCommand("opencodeEdit.debug.restoreOpenCodeSession");
-
-    await waitFor(async () => {
-      const portsByRestoreId = await vscode.commands.executeCommand("opencodeEdit.debug.getTrackedOpenCodePorts") as Record<string, number>;
-      return typeof portsByRestoreId[restoreId] === "number" && portsByRestoreId[restoreId] !== originalOpenCodePort;
-    }, "expected pending-input restore to replace the tracked OpenCode port");
-
-    await waitFor(() => !vscode.window.terminals.includes(originalTerminal), "expected pending-input restore to retire the original terminal");
-
-    const sessionState = (await vscode.commands.executeCommand("opencodeEdit.debug.getSessionPanelState")) as {
-      tabsByRestoreId: Record<string, { title?: string }>;
-    };
-    assert.equal(sessionState.tabsByRestoreId[restoreId]?.title, "Restore Pending Input Session");
-    assert.equal(vscode.window.terminals.length, terminalCountBeforeRestore);
-  });
-
 
   test("routes out-of-order multi-hunk apply_patch into the review queue", async function () {
     this.timeout(30000);

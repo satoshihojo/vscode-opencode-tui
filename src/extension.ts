@@ -928,9 +928,11 @@ function createDebugCommandRegistrations({
           environment: {
             OPENCODE_CALLER: launch.env.OPENCODE_CALLER,
             OPENCODE_TUI_CONFIG: launch.env.OPENCODE_TUI_CONFIG,
+            OPENCODE_VSCODE_BRIDGE_PORT: launch.env.OPENCODE_VSCODE_BRIDGE_PORT,
             OPENCODE_VSCODE_BRIDGE_TOKEN: launch.env.OPENCODE_VSCODE_BRIDGE_TOKEN,
             OPENCODE_VSCODE_BRIDGE_URL: launch.env.OPENCODE_VSCODE_BRIDGE_URL,
             OPENCODE_VSCODE_WORKSPACE_ROOTS: launch.env.OPENCODE_VSCODE_WORKSPACE_ROOTS,
+            WSLENV: launch.env.WSLENV,
             _EXTENSION_OPENCODE_PORT: launch.env._EXTENSION_OPENCODE_PORT,
           },
         };
