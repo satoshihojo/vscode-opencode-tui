@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { matchesPermissionPattern } from "../../src/path-permission";
+import { toWorkspaceUncPath } from "../../src/bridge/wsl-uri";
 
 describe("bridge-editing permission patterns", () => {
   it("matches exact paths", () => {
@@ -43,5 +44,39 @@ describe("bridge-editing permission patterns", () => {
 
     assert.equal(matchesPermissionPattern(path.join(root, "file.ts"), pattern), true);
     assert.equal(matchesPermissionPattern(path.join(root, "nested", "file.ts"), pattern), false);
+  });
+});
+
+describe("toWorkspaceUncPath", () => {
+  const wsl = { distro: "Ubuntu", linuxRoot: "/home/me/proj" };
+
+  it("returns undefined when no WSL context is supplied", () => {
+    assert.equal(toWorkspaceUncPath("/home/me/proj/src/new.ts", undefined), undefined);
+    assert.equal(toWorkspaceUncPath("src/new.ts", undefined), undefined);
+  });
+
+  it("translates an absolute Linux path to a WSL UNC path", () => {
+    assert.equal(
+      toWorkspaceUncPath("/home/me/proj/src/new.ts", wsl),
+      "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj\\src\\new.ts",
+    );
+  });
+
+  it("joins a relative Linux path against the WSL linuxRoot", () => {
+    assert.equal(
+      toWorkspaceUncPath("src/new.ts", wsl),
+      "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj\\src\\new.ts",
+    );
+  });
+
+  it("handles backslash-separated relative paths from opencode", () => {
+    assert.equal(
+      toWorkspaceUncPath("src\\nested\\new.ts", wsl),
+      "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj\\src\\nested\\new.ts",
+    );
+  });
+
+  it("resolves an absolute path outside the workspace root", () => {
+    assert.equal(toWorkspaceUncPath("/etc/passwd", wsl), "\\\\wsl.localhost\\Ubuntu\\etc\\passwd");
   });
 });

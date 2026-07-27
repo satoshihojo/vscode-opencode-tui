@@ -214,7 +214,7 @@ export class OpenCodeSessionRepository {
     }
 
     const command = this.createSpawnCommand(["session", "delete", sessionId]);
-    const result = this.run(command.command, command.args, { encoding: "utf8", timeout: 5000 });
+    const result = this.run(command.command, command.args, { encoding: "utf8", timeout: resolveSpawnTimeout(command.wslBridged) });
 
     if (result.status !== 0) {
       throw new Error(`Failed to delete OpenCode session: ${formatFailure(result)}`);
@@ -273,7 +273,7 @@ export class OpenCodeSessionRepository {
 
   private querySessionsCli(query: string, cwd?: string) {
     const command = this.createSpawnCommand(["db", query, "--format", "json"], cwd);
-    const result = this.run(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
+    const result = this.run(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: resolveSpawnTimeout(command.wslBridged) });
 
     if (result.status !== 0) {
       throw new Error(`Failed to list OpenCode sessions: ${formatFailure(result)}`);
@@ -289,7 +289,7 @@ export class OpenCodeSessionRepository {
 
   private async querySessionsAsyncCli(query: string, cwd?: string) {
     const command = this.createSpawnCommand(["db", query, "--format", "json"], cwd);
-    const result = await this.runAsync(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
+    const result = await this.runAsync(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: resolveSpawnTimeout(command.wslBridged) });
 
     if (result.status !== 0) {
       throw new Error(`Failed to list OpenCode sessions: ${formatFailure(result)}`);
@@ -408,7 +408,7 @@ export class OpenCodeSessionRepository {
     }
 
     const command = this.createSpawnCommand(["db", "path"], cwd);
-    const pathResult = this.run(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
+    const pathResult = this.run(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: resolveSpawnTimeout(command.wslBridged) });
     if (pathResult.status !== 0) {
       throw new Error(`Failed to ${action} OpenCode session: ${formatFailure(pathResult)}`);
     }
@@ -430,7 +430,7 @@ export class OpenCodeSessionRepository {
     }
 
     const command = this.createSpawnCommand(["db", "path"], cwd);
-    const pathResult = await this.runAsync(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: 5000 });
+    const pathResult = await this.runAsync(command.command, command.args, { cwd: command.cwd, encoding: "utf8", timeout: resolveSpawnTimeout(command.wslBridged) });
     if (pathResult.status !== 0) {
       throw new Error(`Failed to ${action} OpenCode session: ${formatFailure(pathResult)}`);
     }
@@ -453,13 +453,13 @@ export class OpenCodeSessionRepository {
     return override.session;
   }
 
-  private createSpawnCommand(args: readonly string[], cwd?: string): { command: string; args: string[]; cwd?: string } {
+  private createSpawnCommand(args: readonly string[], cwd?: string): { command: string; args: string[]; cwd?: string; wslBridged: boolean } {
     const wslBridge = resolveWslBridgedSpawn(this.command, args, cwd, this.platform);
     if (wslBridge) {
-      return wslBridge;
+      return { ...wslBridge, wslBridged: true };
     }
     const resolved = resolveOpenCodeSpawnCommand(this.command, args, this.platform);
-    return { command: resolved.command, args: resolved.args, cwd };
+    return { command: resolved.command, args: resolved.args, cwd, wslBridged: false };
   }
 
   private readLatestSessionOverrideByTitle(title: string, cwd?: string) {
@@ -479,6 +479,18 @@ const MAX_COMMAND_OUTPUT_BYTES = 10 * 1024 * 1024;
 const TERMINATION_GRACE_MS = 250;
 const DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 1000;
 const READ_SQLITE_BUSY_TIMEOUT_MS = 0;
+
+// Native `opencode db` queries finish in tens of milliseconds. When bridged
+// through wsl.exe + bash -ic, the same call pays for wsl boot, bash rc
+// sourcing, and the Go binary's cold start, which on a warm distro is ~6-7s
+// and even higher on a cold boot. Use a generous ceiling so listing doesn't
+// time out before the WSL distro is warm.
+const NATIVE_SPAWN_TIMEOUT_MS = 5000;
+const WSL_SPAWN_TIMEOUT_MS = 20000;
+
+function resolveSpawnTimeout(wslBridged: boolean): number {
+  return wslBridged ? WSL_SPAWN_TIMEOUT_MS : NATIVE_SPAWN_TIMEOUT_MS;
+}
 
 function parseSessionRecord(value: unknown): OpenCodeSessionSummary[] {
   if (!value || typeof value !== "object") {

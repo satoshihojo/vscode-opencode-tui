@@ -1115,7 +1115,17 @@ function tryConvertWslPathToWindows(wslPath: string): string | undefined {
   return `${driveLetter}:\\${rest}`;
 }
 
+// WSL UNC paths (\\wsl.localhost\... or \\wsl$\...) require a win32<->WSL
+// boundary hop on every vscode.workspace.fs.stat, which serializes through the
+// UNC redirector and can take hundreds of ms per row. With many sessions this
+// froze the Quick Pick for several seconds. Assume the dir exists; the session
+// launcher surfaces truly-missing dirs at start time.
+const WSL_UNC_PATH_PATTERN = /^\\\\wsl(?:\.localhost|\$)?\\/i;
+
 async function pathExists(path: string): Promise<boolean> {
+  if (WSL_UNC_PATH_PATTERN.test(path)) {
+    return true;
+  }
   try {
     await vscode.workspace.fs.stat(vscode.Uri.file(path));
     return true;

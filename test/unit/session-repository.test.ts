@@ -361,12 +361,12 @@ describe("OpenCodeSessionRepository", () => {
   });
 
   it("bridges WSL UNC workspaces through wsl.exe and skips bundled sqlite for async session reads", async () => {
-    const calls: Array<{ command: string; args: string[]; cwd?: string }> = [];
+    const calls: Array<{ command: string; args: string[]; cwd?: string; timeout: number }> = [];
     let openedDatabase = false;
     const repository = new OpenCodeSessionRepository({
       platform: "win32",
       runAsync: async (command, args, options) => {
-        calls.push({ command, args, cwd: options?.cwd });
+        calls.push({ command, args, cwd: options?.cwd, timeout: options?.timeout ?? 0 });
         return {
           status: 0,
           stdout: JSON.stringify([{ id: "ses_wsl", title: "WSL", directory: "/home/me/proj", time_updated: 30 }]),
@@ -389,6 +389,7 @@ describe("OpenCodeSessionRepository", () => {
       command: "wsl.exe",
       args: ["-d", "Ubuntu", "--cd", "/home/me/proj", "-e", "bash", "-ic", "opencode 'db' 'select id, project_id, parent_id, title, directory, time_created, time_updated, time_archived from session where id = '\\''ses_wsl'\\'' limit 1' '--format' 'json'"],
       cwd: undefined,
+      timeout: 20000,
     });
   });
 

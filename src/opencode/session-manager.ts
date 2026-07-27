@@ -472,21 +472,13 @@ export function buildWslBridgeCommand(
   );
   env.WSLENV = augmentWslenvForWslBridge(baseEnv.WSLENV, wslenvEntries);
 
-  return [
-    // Auto-detect the Windows host IP from the WSL2 NAT default-route next hop;
-    // fall back to the /etc/resolv.conf nameserver (traditional WSL2 NAT), then
-    // 127.0.0.1 (Windows 11 mirrored networking shares loopback between WSL
-    // and the Windows host).
-    "WIN_HOST_IP=$(ip route show default 2>/dev/null | awk '{print $3; exit}');",
-    "if [ -z \"$WIN_HOST_IP\" ]; then",
-    "WIN_HOST_IP=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null);",
-    "fi;",
-    "if [ -z \"$WIN_HOST_IP\" ]; then",
-    "WIN_HOST_IP=127.0.0.1;",
-    "fi;",
-    `export OPENCODE_VSCODE_BRIDGE_URL="http://\${WIN_HOST_IP}:${bridgePort}/bridge";`,
-    rawCommand,
-  ].join(" ");
+  // Resolve the Windows host IP from inside WSL at runtime, then export the
+  // bridge URL with a parameter-expansion fallback. On WSL2 NAT, the default
+  // route's next hop is the Windows host; on Windows 11 mirrored networking or
+  // WSL1 there is no `default` route, so the lookup yields empty and
+  // `${WIN_HOST_IP:-127.0.0.1}` falls back to loopback (which reaches the
+  // Windows host in those modes).
+  return `WIN_HOST_IP=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}'); export OPENCODE_VSCODE_BRIDGE_URL="http://\${WIN_HOST_IP:-127.0.0.1}:${bridgePort}/bridge"; ${rawCommand}`;
 }
 
 function collectWslBridgeEnvKeys(env: Record<string, string>): string[] {

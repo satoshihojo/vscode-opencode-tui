@@ -6,6 +6,28 @@ import { deriveNewContentsFromChunks, parsePatch } from "./apply-patch";
 import type { BridgePermissionRule, BridgeRequest } from "./bridge-protocol";
 import { toDisplayPathForFile } from "./display-path";
 import { isWithinRoot, matchesPermissionPattern, resolveRealPathForComparison } from "./path-permission";
+import { parseWslUncPath } from "./opencode/command";
+import { toWorkspaceUncPath } from "./bridge/wsl-uri";
+
+/**
+ * Resolve a Linux path that opencode sent (absolute like `/home/me/file` or
+ * relative like `src/file`) into a `vscode.Uri` that points at the same file
+ * inside a WSL distro when the extension host runs on Windows and any
+ * workspace folder is a WSL UNC path (e.g. `\\wsl.localhost\Ubuntu\home\me`).
+ *
+ * Returns undefined when no WSL translation applies so callers can fall back
+ * to the existing `vscode.Uri.file(...)` path.
+ */
+export function resolveWslWorkspaceContext(): { distro: string; linuxRoot: string } | undefined {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  for (const folder of folders) {
+    const parsed = parseWslUncPath(folder.uri.fsPath);
+    if (parsed) {
+      return { distro: parsed.distro, linuxRoot: parsed.path };
+    }
+  }
+  return undefined;
+}
 
 type ChangeKind = "add" | "update" | "delete" | "move";
 
@@ -77,7 +99,10 @@ function trustedWorktreeRoot(
     throw new Error("OpenCode bridge requires at least one target file.");
   }
 
-  const normalizedRequested = path.resolve(requestedWorktree);
+  const wsl = resolveWslWorkspaceContext();
+  const normalizedRequested = wsl
+    ? vscode.Uri.file(toWorkspaceUncPath(requestedWorktree, wsl) ?? requestedWorktree).fsPath
+    : path.resolve(requestedWorktree);
   const requestedRealPath = resolveRealPathForComparison(normalizedRequested);
   const targetRealPaths = targets.map((target) => resolveRealPathForComparison(target.uri.fsPath));
   const containingWorkspace = folders.find((folder) => {
@@ -85,7 +110,9 @@ function trustedWorktreeRoot(
     return targetRealPaths.every((targetPath) => isWithinRoot(targetPath, folderRealPath));
   });
 
-  const normalizedDirectory = path.resolve(directory);
+  const normalizedDirectory = wsl
+    ? vscode.Uri.file(toWorkspaceUncPath(directory, wsl) ?? directory).fsPath
+    : path.resolve(directory);
   const directoryRealPath = resolveRealPathForComparison(normalizedDirectory);
   const workspaceRealPaths = folders.map((folder) => resolveRealPathForComparison(folder.uri.fsPath));
   const untrustedTargets = targets.filter((target, index) => {
@@ -121,12 +148,13 @@ function resolveApplyPatchTarget(directory: string, worktree: string, filePath: 
 }
 
 function resolveApplyPatchTargetUri(directory: string, worktree: string, filePath: string) {
-  if (path.isAbsolute(filePath)) {
-    return vscode.Uri.file(filePath);
+  const wsl = resolveWslWorkspaceContext();
+  if (path.posix.isAbsolute(filePath)) {
+    return vscode.Uri.file(toWorkspaceUncPath(filePath, wsl) ?? filePath);
   }
 
-  const directUri = vscode.Uri.file(path.join(directory, filePath));
-  const worktreeUri = vscode.Uri.file(path.join(worktree, filePath));
+  const directUri = vscode.Uri.file(toWorkspaceUncPath(path.posix.join(directory, filePath), wsl) ?? path.join(directory, filePath));
+  const worktreeUri = vscode.Uri.file(toWorkspaceUncPath(path.posix.join(worktree, filePath), wsl) ?? path.join(worktree, filePath));
   if (!workspaceFolderForUri(directUri) && !workspaceFolderForUri(worktreeUri)) {
     return directUri;
   }
@@ -140,7 +168,13 @@ function resolveApplyPatchTargetUri(directory: string, worktree: string, filePat
   }
 
   const existingWorkspaceCandidates = (vscode.workspace.workspaceFolders ?? [])
-    .map((folder) => vscode.Uri.file(path.join(folder.uri.fsPath, filePath)))
+    .map((folder) => {
+      const folderContext = parseWslUncPath(folder.uri.fsPath);
+      if (folderContext) {
+        return vscode.Uri.file(toWorkspaceUncPath(path.posix.join(folderContext.path, filePath), wsl) ?? path.join(folder.uri.fsPath, filePath));
+      }
+      return vscode.Uri.file(path.join(folder.uri.fsPath, filePath));
+    })
     .filter((uri) => fileExists(uri));
   if (existingWorkspaceCandidates.length === 1) {
     return existingWorkspaceCandidates[0];
@@ -160,22 +194,29 @@ function resolveTarget(directory: string, worktree: string, filePath: string): R
 }
 
 function resolveTargetUri(directory: string, worktree: string, filePath: string) {
-  if (path.isAbsolute(filePath)) {
-    return vscode.Uri.file(filePath);
+  const wsl = resolveWslWorkspaceContext();
+  if (path.posix.isAbsolute(filePath)) {
+    return vscode.Uri.file(toWorkspaceUncPath(filePath, wsl) ?? filePath);
   }
 
-  const directUri = vscode.Uri.file(path.join(directory, filePath));
+  const directUri = vscode.Uri.file(toWorkspaceUncPath(path.posix.join(directory, filePath), wsl) ?? path.join(directory, filePath));
   if (workspaceFolderForUri(directUri)) {
     return directUri;
   }
 
-  const worktreeUri = vscode.Uri.file(path.join(worktree, filePath));
+  const worktreeUri = vscode.Uri.file(toWorkspaceUncPath(path.posix.join(worktree, filePath), wsl) ?? path.join(worktree, filePath));
   if (workspaceFolderForUri(worktreeUri)) {
     return worktreeUri;
   }
 
   const existingWorkspaceCandidates = (vscode.workspace.workspaceFolders ?? [])
-    .map((folder) => vscode.Uri.file(path.join(folder.uri.fsPath, filePath)))
+    .map((folder) => {
+      const folderContext = parseWslUncPath(folder.uri.fsPath);
+      if (folderContext) {
+        return vscode.Uri.file(toWorkspaceUncPath(path.posix.join(folderContext.path, filePath), wsl) ?? path.join(folder.uri.fsPath, filePath));
+      }
+      return vscode.Uri.file(path.join(folder.uri.fsPath, filePath));
+    })
     .filter((uri) => fileExists(uri));
   if (existingWorkspaceCandidates.length === 1) {
     return existingWorkspaceCandidates[0];
@@ -187,6 +228,10 @@ function resolveTargetUri(directory: string, worktree: string, filePath: string)
 
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length === 1) {
+    const folderContext = parseWslUncPath(folders[0].uri.fsPath);
+    if (folderContext) {
+      return vscode.Uri.file(toWorkspaceUncPath(path.posix.join(folderContext.path, filePath), wsl) ?? path.join(folders[0].uri.fsPath, filePath));
+    }
     return vscode.Uri.file(path.join(folders[0].uri.fsPath, filePath));
   }
 

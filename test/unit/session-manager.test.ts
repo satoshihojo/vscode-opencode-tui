@@ -863,7 +863,7 @@ describe("OpenCodeSessionManager WSL bridge env translation", () => {
     assert.equal(launch.shellPath, "wsl.exe");
     assert.deepEqual(launch.shellArgs, ["-d", "Ubuntu", "--cd", "/home/me/proj"]);
 
-    const expectedPreamble = `WIN_HOST_IP=$(ip route show default 2>/dev/null | awk '{print $3; exit}'); if [ -z "$WIN_HOST_IP" ]; then WIN_HOST_IP=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null); fi; if [ -z "$WIN_HOST_IP" ]; then WIN_HOST_IP=127.0.0.1; fi; export OPENCODE_VSCODE_BRIDGE_URL="http://\${WIN_HOST_IP}:9000/bridge"; opencode --port 9001 -s ses_abcdef123456`;
+    const expectedPreamble = `WIN_HOST_IP=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}'); export OPENCODE_VSCODE_BRIDGE_URL="http://\${WIN_HOST_IP:-127.0.0.1}:9000/bridge"; opencode --port 9001 -s ses_abcdef123456`;
     assert.equal(launch.command, expectedPreamble);
   });
 
