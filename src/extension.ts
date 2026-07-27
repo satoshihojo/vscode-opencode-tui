@@ -516,6 +516,14 @@ export function activate(context: vscode.ExtensionContext) {
     };
     const restoreId = createSessionRestoreId();
     trackedSessionStates.set(restoreId, createRestoreSessionTrackingState(options.sessionId));
+    restoreInfosByRestoreId.set(restoreId, {
+      restoreId,
+      sessionId: options.sessionId,
+      sessionLabel: options.sessionLabel,
+      terminalName: normalizedOptions.terminalName,
+      cwd: options.cwd,
+      startedAt,
+    });
     const launch = sessionManager.buildLaunchSpec(process.env, normalizedOptions);
     const session = sessionManager.startLaunchSpec(launch) as ManagedOpenCodeSession;
     restoreIdsByOpenCodePort.set(session.openCodePort, restoreId);
